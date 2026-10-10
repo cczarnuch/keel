@@ -1,0 +1,592 @@
+#!/usr/bin/env python3
+"""Keel — Steam Play compatibility tool for macOS.
+
+Steam invokes this the way it invokes Proton:
+
+    keel waitforexitandrun <windows-exe> [args...]
+
+Logs go to stderr and to $STEAM_COMPAT_DATA_PATH/keel.log.
+Path verbs print a single path on stdout and nothing else.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tarfile
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+VERSION = "0.9.0"
+USAGE = """\
+Keel {version} — Steam Play for macOS
+
+  keel waitforexitandrun <exe> [args...]   launch and wait (Steam's verb)
+  keel run <exe> [args...]                 launch and wait
+  keel runinprefix <exe> [args...]         same, inside the prefix
+  keel destroyprefix                       delete STEAM_COMPAT_DATA_PATH
+  keel getcompatpath <unix-path>           print the Wine path
+  keel getnativepath <windows-path>        print the macOS path
+  keel setup-steam                         install the Windows Steam client
+  keel fetch-dxmt                          download DXMT into Application Support
+  keel doctor                              print what this Mac can run
+  keel version
+""".format(version=VERSION)
+
+
+def support_dir() -> Path:
+    return Path.home() / "Library" / "Application Support" / "Keel"
+
+
+def tool_dir() -> Path:
+    return Path(__file__).resolve().parent
+
+
+def log_file() -> Path | None:
+    data = os.environ.get("STEAM_COMPAT_DATA_PATH")
+    if not data:
+        return None
+    path = Path(data)
+    path.mkdir(parents=True, exist_ok=True)
+    return path / "keel.log"
+
+
+def log(message: str) -> None:
+    line = message.rstrip()
+    print(line, file=sys.stderr)
+    path = log_file()
+    if path is None:
+        return
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(line + "\n")
+
+
+def load_user_settings(directory: Path) -> dict[str, str]:
+    path = directory / "user_settings.py"
+    if not path.is_file():
+        return {}
+    spec = importlib.util.spec_from_file_location("keel_user_settings", path)
+    if spec is None or spec.loader is None:
+        return {}
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    raw = getattr(module, "user_settings", {}) or {}
+    return {str(key): str(value) for key, value in raw.items()}
+
+
+def load_conf(path: Path) -> dict[str, str]:
+    if not path.is_file():
+        return {}
+    values: dict[str, str] = {}
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip()
+    return values
+
+
+def appid() -> str:
+    for key in ("STEAM_COMPAT_APP_ID", "SteamAppId", "SteamGameId"):
+        value = os.environ.get(key, "")
+        if value.isdigit():
+            return value
+    data = os.environ.get("STEAM_COMPAT_DATA_PATH", "")
+    name = Path(data).name if data else ""
+    return name if name.isdigit() else ""
+
+
+def apply_config() -> dict[str, str]:
+    """user_settings.py, then per-app conf. Existing env wins."""
+    merged: dict[str, str] = {}
+    merged.update(load_user_settings(tool_dir()))
+    aid = appid()
+    if aid:
+        merged.update(load_conf(tool_dir() / "apps" / f"{aid}.conf"))
+        merged.update(load_conf(support_dir() / "apps" / f"{aid}.conf"))
+    data = os.environ.get("STEAM_COMPAT_DATA_PATH")
+    if data:
+        merged.update(load_conf(Path(data) / "keel.conf"))
+    applied: dict[str, str] = {}
+    for key, value in merged.items():
+        upper = key.upper()
+        # lowercase conf keys are aliases, not exported verbatim
+        if key.islower():
+            applied[key] = value
+            continue
+        if upper not in os.environ:
+            os.environ[upper] = value
+        applied[upper] = os.environ.get(upper, value)
+    return applied
+
+
+def conf_get(applied: dict[str, str], env_key: str, conf_key: str, default: str) -> str:
+    if conf_key in applied and env_key not in os.environ:
+        return applied[conf_key]
+    return os.environ.get(env_key, applied.get(env_key, applied.get(conf_key, default)))
+
+
+def executable(path: Path) -> bool:
+    return path.is_file() and os.access(path, os.X_OK)
+
+
+def whisky_wines() -> list[Path]:
+    roots = [
+        Path.home() / "Library" / "Application Support" / "com.isaacmarovitz.Whisky",
+        Path.home() / "Library" / "Application Support" / "Whisky",
+    ]
+    found: list[Path] = []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for path in root.glob("Libraries/**/bin/wine64"):
+            if executable(path):
+                found.append(path)
+        for path in root.glob("Libraries/**/wine64"):
+            if executable(path) and path not in found:
+                found.append(path)
+    return found
+
+
+def family_candidates(runner: str) -> list[Path]:
+    crossover = [
+        Path("/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine64"),
+        Path("/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine"),
+    ]
+    gptk = [
+        Path("/usr/local/opt/game-porting-toolkit/bin/wine64"),
+        Path("/usr/local/opt/game-porting-toolkit/bin/wine"),
+        Path("/opt/homebrew/opt/game-porting-toolkit/bin/wine64"),
+        Path("/opt/homebrew/opt/game-porting-toolkit/bin/wine"),
+    ]
+    brew = [
+        Path("/opt/homebrew/bin/wine64"),
+        Path("/opt/homebrew/bin/wine"),
+        Path("/usr/local/bin/wine64"),
+        Path("/usr/local/bin/wine"),
+    ]
+    groups = {
+        "crossover": crossover,
+        "gptk": gptk,
+        "whisky": whisky_wines(),
+        "wine": brew,
+        "auto": crossover + gptk + whisky_wines() + brew,
+    }
+    return groups.get(runner, groups["auto"])
+
+
+def find_runner(runner: str) -> Path | None:
+    if runner == "auto":
+        forced = os.environ.get("KEEL_WINE", "")
+        if forced and executable(Path(forced)):
+            return Path(forced)
+    for candidate in family_candidates(runner):
+        if executable(candidate):
+            return candidate
+    return None
+
+
+def dxmt_dll_dir() -> Path | None:
+    env = os.environ.get("KEEL_DXMT", "")
+    candidates = []
+    if env:
+        candidates.append(Path(env))
+    marker = support_dir() / "dxmt" / "location.txt"
+    if marker.is_file():
+        candidates.append(Path(marker.read_text(encoding="utf-8").strip()))
+    candidates.append(support_dir() / "dxmt" / "x64")
+    candidates.append(tool_dir() / "dxmt" / "x64")
+    for directory in candidates:
+        if (directory / "d3d11.dll").is_file():
+            return directory
+        if (directory / "x64" / "d3d11.dll").is_file():
+            return directory / "x64"
+    return None
+
+
+def steam_client_prefix() -> Path:
+    return support_dir() / "steam-client" / "pfx"
+
+
+def steam_exe_path() -> Path:
+    return steam_client_prefix() / "drive_c" / "Program Files (x86)" / "Steam" / "steam.exe"
+
+
+def prefix_path() -> Path:
+    data = os.environ.get("STEAM_COMPAT_DATA_PATH")
+    if data:
+        return Path(data) / "pfx"
+    aid = appid() or "manual"
+    return support_dir() / "compatdata" / aid / "pfx"
+
+
+def data_path() -> Path:
+    data = os.environ.get("STEAM_COMPAT_DATA_PATH")
+    if data:
+        return Path(data)
+    return prefix_path().parent
+
+
+def wine_env(wine: Path, prefix: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    env["WINEPREFIX"] = str(prefix)
+    env.setdefault("WINEDEBUG", "-all")
+    bindir = str(wine.parent)
+    env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
+    return env
+
+
+def ensure_prefix(wine: Path, prefix: Path, winver: str) -> None:
+    prefix.mkdir(parents=True, exist_ok=True)
+    env = wine_env(wine, prefix)
+    system = prefix / "system.reg"
+    if not system.is_file():
+        log(f"creating prefix {prefix}")
+        subprocess.run([str(wine), "wineboot", "--init"], env=env, check=False)
+    version_file = prefix.parent / "version"
+    stamp = f"keel-{VERSION}-win{winver}"
+    if version_file.is_file() and version_file.read_text(encoding="utf-8").strip() == stamp:
+        return
+    log(f"setting Windows version {winver}")
+    subprocess.run(
+        [str(wine), "reg", "add", r"HKCU\Software\Wine", "/v", "Version", "/d", winver, "/f"],
+        env=env,
+        check=False,
+    )
+    version_file.write_text(stamp + "\n", encoding="utf-8")
+
+
+def stage_native_dlls(prefix: Path, directory: Path) -> None:
+    system32 = prefix / "drive_c" / "windows" / "system32"
+    if not system32.is_dir():
+        log(f"prefix has no system32 yet; cannot stage {directory}")
+        return
+    for dll in sorted(directory.glob("*.dll")):
+        target = system32 / dll.name
+        if target.is_file() and target.stat().st_size == dll.stat().st_size:
+            continue
+        shutil.copy2(dll, target)
+        log(f"staged {dll.name}")
+
+
+def resolve_graphics(requested: str) -> str:
+    if requested != "auto":
+        return requested
+    return "dxmt"
+
+
+def dll_overrides(graphics: str, extra: str) -> str:
+    table = {
+        "dxmt": "d3d11,dxgi,d3d10core=n,b",
+        "dxvk": "d3d11,dxgi,d3d10core,d3d9=n,b",
+        "d3dmetal": "d3d11,dxgi,d3d12=b",
+        "wined3d": "d3d11,dxgi,d3d12,d3d9=b",
+    }
+    parts = [table[graphics]] if graphics in table else []
+    if extra:
+        parts.append(extra)
+    return ";".join(parts)
+
+
+def to_windows_path(prefix: Path, unix_path: str) -> str:
+    path = str(Path(unix_path).expanduser().resolve())
+    drive_c = str((prefix / "drive_c").resolve())
+    if path == drive_c or path.startswith(drive_c + os.sep):
+        tail = path[len(drive_c) :].replace(os.sep, "\\")
+        return "C:" + tail
+    return "Z:" + path.replace(os.sep, "\\")
+
+
+def to_unix_path(prefix: Path, windows_path: str) -> str:
+    text = windows_path.replace("\\", "/")
+    if len(text) >= 2 and text[1] == ":":
+        letter = text[0].upper()
+        tail = text[2:]
+        if letter == "C":
+            return str(prefix / "drive_c" / tail.lstrip("/"))
+        if letter == "Z":
+            return tail if tail.startswith("/") else "/" + tail
+    return text
+
+
+def refuse_dangerous(path: Path) -> Path:
+    resolved = path.expanduser().resolve()
+    home = Path.home().resolve()
+    if resolved == home or resolved == Path("/") or home not in resolved.parents:
+        raise SystemExit(f"refusing to delete {resolved}")
+    return resolved
+
+
+def command_args(argv: list[str]) -> list[str]:
+    if len(argv) < 3:
+        raise SystemExit("missing command")
+    return argv[2:]
+
+
+def prepare_and_launch(argv: list[str], applied: dict[str, str]) -> int:
+    command = command_args(argv)
+    runner_name = conf_get(applied, "KEEL_RUNNER", "runner", "auto")
+    graphics = resolve_graphics(conf_get(applied, "KEEL_GRAPHICS", "graphics", "auto"))
+    winver = conf_get(applied, "KEEL_WINVER", "winver", "win10")
+    esync = conf_get(applied, "KEEL_ESYNC", "esync", "1")
+    hud = conf_get(applied, "KEEL_HUD", "hud", "0")
+    steamworks = conf_get(applied, "KEEL_STEAMWORKS", "steamworks", "direct")
+    extra_dll = conf_get(applied, "KEEL_DLL", "dll", "")
+    extra_args = conf_get(applied, "KEEL_ARGS", "args", "")
+
+    wine = find_runner(runner_name)
+    prefix = prefix_path()
+    if steamworks == "prefix" and steam_exe_path().is_file():
+        prefix = steam_client_prefix()
+
+    log(f"======== Keel {VERSION}  {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}Z")
+    log(f"verb: {argv[1]}")
+    log(f"appid: {appid() or '(none)'}")
+    log(f"graphics: {graphics}")
+    log(f"runner request: {runner_name}")
+    if wine is None:
+        log("no Wine runner found. Install CrossOver, Game Porting Toolkit, Whisky, or Homebrew wine.")
+        for candidate in family_candidates(runner_name):
+            log(f"  missing {candidate}")
+        return 1
+    log(f"wine: {wine}")
+    log(f"prefix: {prefix}")
+
+    ensure_prefix(wine, prefix, winver)
+    env = wine_env(wine, prefix)
+    if esync == "1":
+        env["WINEESYNC"] = "1"
+    env["ROSETTA_ADVERTISE_AVX"] = "1"
+    env["MTL_HUD_ENABLED"] = "1" if hud == "1" else "0"
+    env["DXMT_LOG_LEVEL"] = "info" if hud == "1" else "none"
+
+    if graphics == "dxmt":
+        dlls = dxmt_dll_dir()
+        if dlls is None:
+            log("DXMT not installed; falling back to WineD3D. Run: keel fetch-dxmt")
+            graphics = "wined3d"
+        else:
+            stage_native_dlls(prefix, dlls)
+            log(f"dxmt: {dlls}")
+    elif graphics == "dxvk":
+        dxvk = support_dir() / "dxvk" / "x64"
+        if (dxvk / "d3d11.dll").is_file():
+            stage_native_dlls(prefix, dxvk)
+        else:
+            log("DXVK macOS build not in ~/Library/Application Support/Keel/dxvk/x64; using WineD3D")
+            graphics = "wined3d"
+    elif graphics == "d3dmetal":
+        log("D3DMetal uses the runner's builtin. CrossOver or Game Porting Toolkit is required.")
+
+    env["WINEDLLOVERRIDES"] = dll_overrides(graphics, extra_dll)
+
+    launch = list(command)
+    aid = appid()
+    if steamworks == "prefix" and aid:
+        steam_exe = steam_exe_path()
+        if steam_exe.is_file():
+            ensure_shared_library(steam_exe.parent)
+            launch = [str(steam_exe), "-applaunch", aid]
+            log("steamworks: Windows Steam client -applaunch")
+        else:
+            log("steamworks=prefix but Windows Steam is not installed. Run: keel setup-steam")
+    if extra_args:
+        launch.extend(extra_args.split())
+
+    log("command: " + " ".join(launch))
+    proc = subprocess.Popen([str(wine), *launch], env=env)
+    code = proc.wait()
+    wineserver = wine.parent / "wineserver"
+    if executable(wineserver):
+        subprocess.run([str(wineserver), "-w"], env=env, check=False)
+    log(f"exit: {code}")
+    return code
+
+
+def ensure_shared_library(steam_install: Path) -> None:
+    """Point Windows Steam at the Mac client's library folder, once."""
+    mac_library = os.environ.get("STEAM_COMPAT_CLIENT_INSTALL_PATH") or str(
+        Path.home() / "Library" / "Application Support" / "Steam"
+    )
+    folder = steam_install / "steamapps"
+    folder.mkdir(parents=True, exist_ok=True)
+    vdf = folder / "libraryfolders.vdf"
+    win_path = "Z:" + str(Path(mac_library).resolve()).replace("/", "\\")
+    if vdf.is_file():
+        current = vdf.read_text(encoding="utf-8", errors="replace")
+        if win_path in current:
+            return
+        log("libraryfolders.vdf already exists; leaving it untouched")
+        return
+    escaped = win_path.replace("\\", "\\\\")
+    vdf.write_text(
+        '"libraryfolders"\n{\n'
+        '\t"0"\n\t{\n\t\t"path"\t\t"C:\\\\Program Files (x86)\\\\Steam"\n\t}\n'
+        f'\t"1"\n\t{{\n\t\t"path"\t\t"{escaped}"\n\t}}\n'
+        "}\n",
+        encoding="utf-8",
+    )
+    log(f"linked Windows Steam library to {mac_library}")
+
+
+def safe_extract(archive: tarfile.TarFile, destination: Path) -> None:
+    destination = destination.resolve()
+    for member in archive.getmembers():
+        target = (destination / member.name).resolve()
+        if destination != target and destination not in target.parents:
+            raise SystemExit(f"refusing archive path {member.name}")
+    archive.extractall(destination)
+
+
+def fetch_dxmt() -> int:
+    destination = support_dir() / "dxmt"
+    destination.mkdir(parents=True, exist_ok=True)
+    request = urllib.request.Request(
+        "https://api.github.com/repos/3Shain/dxmt/releases/latest",
+        headers={"User-Agent": "Keel", "Accept": "application/vnd.github+json"},
+    )
+    with urllib.request.urlopen(request, timeout=60) as response:
+        payload = json.load(response)
+    assets = payload.get("assets") or []
+    chosen = None
+    for asset in assets:
+        name = asset.get("name", "").lower()
+        if name.endswith((".tar.gz", ".tgz", ".zip")) and any(
+            token in name for token in ("mac", "osx", "darwin", "macos")
+        ):
+            chosen = asset
+            break
+    if chosen is None:
+        for asset in assets:
+            if str(asset.get("name", "")).endswith(".tar.gz"):
+                chosen = asset
+                break
+    if chosen is None:
+        log("DXMT release has no archive asset")
+        return 1
+    url = chosen["browser_download_url"]
+    archive_path = destination / chosen["name"]
+    log(f"downloading {url}")
+    urllib.request.urlretrieve(url, archive_path)
+    extract_root = destination / "src"
+    if extract_root.exists():
+        shutil.rmtree(extract_root)
+    extract_root.mkdir(parents=True)
+    if archive_path.suffix == ".zip":
+        import zipfile
+
+        with zipfile.ZipFile(archive_path) as archive:
+            archive.extractall(extract_root)
+    else:
+        with tarfile.open(archive_path, "r:*") as archive:
+            safe_extract(archive, extract_root)
+    dll = next(extract_root.rglob("d3d11.dll"), None)
+    if dll is None:
+        log("archive did not contain d3d11.dll")
+        return 1
+    (destination / "location.txt").write_text(str(dll.parent) + "\n", encoding="utf-8")
+    log(f"DXMT ready at {dll.parent}")
+    return 0
+
+
+def setup_steam() -> int:
+    wine = find_runner(os.environ.get("KEEL_RUNNER", "auto"))
+    if wine is None:
+        log("no Wine runner found")
+        return 1
+    prefix = support_dir() / "steam-client" / "pfx"
+    ensure_prefix(wine, prefix, os.environ.get("KEEL_WINVER", "win10"))
+    installer = support_dir() / "cache" / "SteamSetup.exe"
+    installer.parent.mkdir(parents=True, exist_ok=True)
+    if not installer.is_file():
+        url = "https://cdn.akamai.steamstatic.com/client/installer/SteamSetup.exe"
+        log(f"downloading {url}")
+        urllib.request.urlretrieve(url, installer)
+    env = wine_env(wine, prefix)
+    log("launching the official Windows Steam installer")
+    return subprocess.run([str(wine), str(installer)], env=env, check=False).returncode
+
+
+def doctor() -> int:
+    steam = Path.home() / "Library" / "Application Support" / "Steam"
+    macos = steam / "Steam.AppBundle" / "Steam" / "Contents" / "MacOS"
+    cfg = macos / "steam_dev.cfg"
+    switch = False
+    if cfg.is_file():
+        switch = "sSteamCmdForcePlatformType" in cfg.read_text(encoding="utf-8", errors="replace")
+    tool = steam / "compatibilitytools.d" / "keel-proton" / "keel"
+    lines = [
+        f"Keel {VERSION}",
+        f"Steam: {'found' if steam.is_dir() else 'not installed'}",
+        f"Compatibility tool: {'installed' if tool.is_file() else 'not installed'}",
+        f"Windows depot switch: {'on' if switch else 'off'}",
+        f"Python: {sys.version.split()[0]}",
+    ]
+    for name in ("crossover", "gptk", "whisky", "wine"):
+        found = find_runner(name)
+        lines.append(f"{name}: {found if found else 'not found'}")
+    dlls = dxmt_dll_dir()
+    lines.append(f"DXMT: {dlls if dlls else 'not installed (keel fetch-dxmt)'}")
+    text = "\n".join(lines)
+    print(text)
+    return 0
+
+
+def destroy_prefix() -> int:
+    target = refuse_dangerous(data_path())
+    if not (target / "pfx").exists() and not (target / "version").exists():
+        log(f"nothing to remove at {target}")
+        return 0
+    shutil.rmtree(target)
+    log(f"removed {target}")
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 2 or argv[1] in ("-h", "--help", "help"):
+        sys.stderr.write(USAGE)
+        return 0 if len(argv) > 1 else 1
+    verb = argv[1]
+    if verb == "version":
+        print(VERSION)
+        return 0
+    if verb == "doctor":
+        apply_config()
+        return doctor()
+    if verb == "fetch-dxmt":
+        return fetch_dxmt()
+    if verb == "setup-steam":
+        apply_config()
+        return setup_steam()
+    applied = apply_config()
+    if verb == "destroyprefix":
+        return destroy_prefix()
+    if verb == "getcompatpath":
+        if len(argv) < 3:
+            return 1
+        print(to_windows_path(prefix_path(), argv[2]))
+        return 0
+    if verb == "getnativepath":
+        if len(argv) < 3:
+            return 1
+        print(to_unix_path(prefix_path(), argv[2]))
+        return 0
+    if verb in ("run", "waitforexitandrun", "runinprefix"):
+        return prepare_and_launch(argv, applied)
+    sys.stderr.write(USAGE)
+    return 1
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv))
+    except KeyboardInterrupt:
+        raise SystemExit(130)
+    except BrokenPipeError:
+        raise SystemExit(0)

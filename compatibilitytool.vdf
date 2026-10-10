@@ -1,0 +1,13 @@
+"compatibilitytools"
+{
+  "compat_tools"
+  {
+    "keel-proton"
+    {
+      "install_path" "."
+      "display_name" "Keel Proton"
+      "from_oslist" "windows"
+      "to_oslist" "macos"
+    }
+  }
+}
