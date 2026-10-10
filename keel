@@ -47,12 +47,28 @@ def tool_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
+def ensure_compat_env() -> None:
+    """Launch Options do not set STEAM_COMPAT_*. Fill them in from SteamAppId.
+
+    The Mac client has no Compatibility page, so this is the normal path.
+    """
+    if os.environ.get("STEAM_COMPAT_DATA_PATH"):
+        return
+    aid = appid()
+    if not aid:
+        return
+    steam = Path.home() / "Library" / "Application Support" / "Steam"
+    os.environ["STEAM_COMPAT_DATA_PATH"] = str(steam / "steamapps" / "compatdata" / aid)
+    os.environ.setdefault("STEAM_COMPAT_CLIENT_INSTALL_PATH", str(steam))
+    os.environ.setdefault("STEAM_COMPAT_APP_ID", aid)
+
+
 def log_file() -> Path | None:
-    data = os.environ.get("STEAM_COMPAT_DATA_PATH")
-    if not data:
+    path = data_path()
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError:
         return None
-    path = Path(data)
-    path.mkdir(parents=True, exist_ok=True)
     return path / "keel.log"
 
 
@@ -524,7 +540,8 @@ def doctor() -> int:
     lines = [
         f"Keel {VERSION}",
         f"Steam: {'found' if steam.is_dir() else 'not installed'}",
-        f"Compatibility tool: {'installed' if tool.is_file() else 'not installed'}",
+        f"Tool files: {'installed' if tool.is_file() else 'not installed'}",
+        f"Compatibility menu: not shown on Mac Steam. Use Launch Options.",
         f"Windows depot switch: {'on' if switch else 'off'}",
         f"Python: {sys.version.split()[0]}",
     ]
@@ -564,6 +581,8 @@ def main(argv: list[str]) -> int:
     if verb == "setup-steam":
         apply_config()
         return setup_steam()
+    if verb in ("run", "waitforexitandrun", "runinprefix", "destroyprefix", "getcompatpath", "getnativepath"):
+        ensure_compat_env()
     applied = apply_config()
     if verb == "destroyprefix":
         return destroy_prefix()

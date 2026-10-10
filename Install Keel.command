@@ -36,15 +36,20 @@ if command -v python3 >/dev/null 2>&1; then
   PY="python3"
 fi
 
+LAUNCH="\"$DEST/keel\" waitforexitandrun %command%"
+printf '%s' "$LAUNCH" | pbcopy
+
 CHOICE="Not now"
 CHOICE="$(osascript <<'APPLESCRIPT' || true
-set theButton to button returned of (display dialog "Keel is registered with Steam as “Keel Proton”.
+set theButton to button returned of (display dialog "Keel is installed.
+
+Mac Steam has no Compatibility section. That page is Linux-only, and Keel cannot add it.
 
 Quit Steam completely (Steam menu, Quit), then open it again.
 
-On a game: Properties, Compatibility, check the force box, and choose Keel Proton.
+A launch option is already on your clipboard. After a game is installed, open Properties and paste it into Launch Options.
 
-Windows-only games stay hidden until Steam will download a Windows copy. Keel can turn on Steam's own developer switch. While it is on, Steam may prefer the Windows build even for games that have a Mac version. You can remove that line from steam_dev.cfg later." buttons {"Not now", "Enable Windows depots"} default button "Not now" with title "Keel")
+Windows-only games stay hidden until Steam will download a Windows copy. Keel can turn that on. While it is on, Steam may prefer the Windows build even for games that have a Mac version. Delete the line from steam_dev.cfg to undo it." buttons {"Not now", "Enable Windows depots"} default button "Enable Windows depots" with title "Keel")
 return theButton
 APPLESCRIPT
 )"

@@ -9,7 +9,15 @@ Keel is not Valve, not Proton, and not affiliated with Steam.
 1. Unzip.
 2. Right-click `Install Keel.command` and choose Open (the first time, macOS will ask).
 3. Quit Steam completely and open it again.
-4. On a game: Properties → Compatibility → check the force box → **Keel Proton**.
+4. On a game: Properties → Launch Options. Paste:
+
+```
+"$HOME/Library/Application Support/Steam/compatibilitytools.d/keel-proton/keel" waitforexitandrun %command%
+```
+
+The installer copies that line to the clipboard.
+
+Mac Steam has no Compatibility section. Valve ships the Steam Play code and leaves the checkbox off. Dropping a tool in `compatibilitytools.d` does not create the menu. Keel does not inject into Steam to force it on. Launch Options is the path that still works after a Steam update.
 
 If a Windows-only game has no Install button, run the installer again and enable the Windows depot switch. That writes one line Valve already documents for developers, `@sSteamCmdForcePlatformType windows`, into `steam_dev.cfg`. While that line is there, Steam may prefer Windows depots even for games that have a Mac build. Remove it from the same file to undo.
 
@@ -27,7 +35,7 @@ DirectX 11 needs [DXMT](https://github.com/3Shain/dxmt). The installer can downl
 
 ## Verbs
 
-Steam calls `keel waitforexitandrun <exe> [args…]` with `STEAM_COMPAT_*` set. Also implemented: `run`, `runinprefix`, `destroyprefix`, `getcompatpath`, `getnativepath`, `setup-steam`, `fetch-dxmt`, `doctor`, `version`.
+Launch Options calls `keel waitforexitandrun <exe> [args…]`. Steam on Mac does not set `STEAM_COMPAT_*`, so Keel fills those in from `SteamAppId`. Also implemented: `run`, `runinprefix`, `destroyprefix`, `getcompatpath`, `getnativepath`, `setup-steam`, `fetch-dxmt`, `doctor`, `version`.
 
 Prefixes live in `STEAM_COMPAT_DATA_PATH` (Steam's `steamapps/compatdata/<appid>`), in the same shape Proton uses.
 
