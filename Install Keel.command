@@ -14,7 +14,7 @@ say() {
 mkdir -p "$(dirname "$DEST")"
 rm -rf "$DEST"
 mkdir -p "$DEST"
-cp "$HERE/compatibilitytool.vdf" "$HERE/toolmanifest.vdf" "$HERE/keel" "$HERE/README.md" "$HERE/user_settings.sample.py" "$DEST/"
+cp "$HERE/compatibilitytool.vdf" "$HERE/toolmanifest.vdf" "$HERE/keel" "$HERE/keel-launch" "$HERE/README.md" "$HERE/user_settings.sample.py" "$DEST/"
 if [ -f "$HERE/user_settings.py" ]; then
   cp "$HERE/user_settings.py" "$DEST/user_settings.py"
 else
@@ -24,19 +24,16 @@ if [ -d "$HERE/apps" ]; then
   rm -rf "$DEST/apps"
   cp -R "$HERE/apps" "$DEST/apps"
 fi
-chmod +x "$DEST/keel"
+chmod +x "$DEST/keel" "$DEST/keel-launch"
 
 if [ -d "$MACOS_DIR" ]; then
   mkdir -p "$MACOS_DIR/compatibilitytools.d"
   ln -sfn "$DEST" "$MACOS_DIR/compatibilitytools.d/keel-proton"
 fi
 
-PY=""
-if command -v python3 >/dev/null 2>&1; then
-  PY="python3"
-fi
-
-LAUNCH="\"$DEST/keel\" waitforexitandrun %command%"
+# Mac Steam returns "OS Error 260" if Launch Options starts with a script.
+# /bin/bash is a real binary. It runs keel-launch, which runs python3.
+LAUNCH="/bin/bash \"$DEST/keel-launch\" %command%"
 printf '%s' "$LAUNCH" | pbcopy
 
 CHOICE="Not now"
@@ -63,6 +60,11 @@ if [ "$CHOICE" = "Enable Windows depots" ]; then
       printf '\n# Keel — delete this line to restore normal Mac Steam behavior\n@sSteamCmdForcePlatformType windows\n' >> "$MACOS_DIR/steam_dev.cfg"
     fi
   fi
+fi
+
+PY=""
+if command -v python3 >/dev/null 2>&1; then
+  PY="$(command -v python3)"
 fi
 
 if [ -n "$PY" ]; then

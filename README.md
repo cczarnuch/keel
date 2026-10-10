@@ -9,13 +9,15 @@ Keel is not Valve, not Proton, and not affiliated with Steam.
 1. Unzip.
 2. Right-click `Install Keel.command` and choose Open (the first time, macOS will ask).
 3. Quit Steam completely and open it again.
-4. On a game: Properties → Launch Options. Paste:
+4. On a game: Properties → Launch Options. Paste the line the installer copied. It looks like this, with your own home folder instead of `YOURNAME`:
 
 ```
-"$HOME/Library/Application Support/Steam/compatibilitytools.d/keel-proton/keel" waitforexitandrun %command%
+/bin/bash "/Users/YOURNAME/Library/Application Support/Steam/compatibilitytools.d/keel-proton/keel-launch" %command%
 ```
 
-The installer copies that line to the clipboard.
+Do not put `$HOME` or a bare path to `keel` in that box. Steam does not expand `$HOME`, and it will not start a script. Both mistakes show up as **Failed to start process: OS Error 260**. The first word has to be `/bin/bash`.
+
+The installer copies a finished line to the clipboard.
 
 Mac Steam has no Compatibility section. Valve ships the Steam Play code and leaves the checkbox off. Dropping a tool in `compatibilitytools.d` does not create the menu. Keel does not inject into Steam to force it on. Launch Options is the path that still works after a Steam update.
 
