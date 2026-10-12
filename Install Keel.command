@@ -12,28 +12,45 @@ say() {
 }
 
 mkdir -p "$(dirname "$DEST")"
+# Keep the user's settings across reinstalls.
+SAVED_SETTINGS=""
+if [ -f "$DEST/user_settings.py" ]; then
+  SAVED_SETTINGS="$(mktemp)"
+  cp "$DEST/user_settings.py" "$SAVED_SETTINGS"
+fi
 rm -rf "$DEST"
 mkdir -p "$DEST"
-cp "$HERE/compatibilitytool.vdf" "$HERE/toolmanifest.vdf" "$HERE/keel" "$HERE/keel-launch" "$HERE/README.md" "$HERE/user_settings.sample.py" "$DEST/"
-if [ -f "$HERE/user_settings.py" ]; then
+cp "$HERE/compatibilitytool.vdf" "$HERE/toolmanifest.vdf" "$HERE/keel" "$HERE/README.md" "$HERE/user_settings.sample.py" "$DEST/"
+if [ -n "$SAVED_SETTINGS" ]; then
+  mv "$SAVED_SETTINGS" "$DEST/user_settings.py"
+elif [ -f "$HERE/user_settings.py" ]; then
   cp "$HERE/user_settings.py" "$DEST/user_settings.py"
 else
   cp "$HERE/user_settings.sample.py" "$DEST/user_settings.py"
+fi
+# Steamworks bridge helper (runs inside the Wine prefix) and its source.
+mkdir -p "$DEST/helpers"
+cp "$HERE/helpers/keel_steam.exe" "$HERE/helpers/keel_steam.c" "$DEST/helpers/"
+# Native launcher so Launch Options need no interpreter path.
+if command -v clang >/dev/null 2>&1 && clang -O2 -o "$DEST/keel-launch" "$HERE/helpers/keel-launch.c"; then
+  chmod +x "$DEST/keel-launch"
 fi
 if [ -d "$HERE/apps" ]; then
   rm -rf "$DEST/apps"
   cp -R "$HERE/apps" "$DEST/apps"
 fi
-chmod +x "$DEST/keel" "$DEST/keel-launch"
+chmod +x "$DEST/keel"
 
 if [ -d "$MACOS_DIR" ]; then
   mkdir -p "$MACOS_DIR/compatibilitytools.d"
   ln -sfn "$DEST" "$MACOS_DIR/compatibilitytools.d/keel-proton"
 fi
 
-# Mac Steam returns "OS Error 260" if Launch Options starts with a script.
-# /bin/bash is a real binary. It runs keel-launch, which runs python3.
-LAUNCH="/bin/bash \"$DEST/keel-launch\" %command%"
+if [ -x "$DEST/keel-launch" ]; then
+  LAUNCH="\"$DEST/keel-launch\" waitforexitandrun %command%"
+else
+  LAUNCH="/usr/bin/python3 \"$DEST/keel\" waitforexitandrun %command%"
+fi
 printf '%s' "$LAUNCH" | pbcopy
 
 CHOICE="Not now"
