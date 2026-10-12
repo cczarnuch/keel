@@ -22,7 +22,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.9.0"
+VERSION = "0.14.0"
 USAGE = """\
 Keel {version} — Steam Play for macOS
 
@@ -35,6 +35,11 @@ Keel {version} — Steam Play for macOS
   keel setup-steam                         install the Windows Steam client
   keel fetch-dxmt                          download DXMT into Application Support
   keel doctor                              print what this Mac can run
+  keel graphics <appid> [backend]          show or set KEEL_GRAPHICS for one game
+
+  KEEL_STEAMWORKS=bridge  Proton-style lsteamclient bridge to Mac Steam (needs KEEL_WINE)
+  KEEL_GRAPHICS=d3dmetal|dxmt|dxvk|wined3d|auto; KEEL_WINE_D3DMETAL / KEEL_WINE_DXMT
+                          pick a runner variant per backend; KEEL_DRY_RUN=1 logs and exits
   keel version
 """.format(version=VERSION)
 
@@ -197,11 +202,19 @@ def family_candidates(runner: str) -> list[Path]:
     return groups.get(runner, groups["auto"])
 
 
+def forced_runner() -> Path | None:
+    forced = os.environ.get("KEEL_WINE", "")
+    if forced:
+        path = Path(forced).expanduser()
+        if executable(path):
+            return path
+    return None
+
+
 def find_runner(runner: str) -> Path | None:
-    if runner == "auto":
-        forced = os.environ.get("KEEL_WINE", "")
-        if forced and executable(Path(forced)):
-            return Path(forced)
+    forced = forced_runner()
+    if forced is not None:
+        return forced
     for candidate in family_candidates(runner):
         if executable(candidate):
             return candidate
@@ -219,10 +232,14 @@ def dxmt_dll_dir() -> Path | None:
     candidates.append(support_dir() / "dxmt" / "x64")
     candidates.append(tool_dir() / "dxmt" / "x64")
     for directory in candidates:
+        # 64-bit games need the x86_64 DLLs; never hand them i386-windows.
+        if directory.name == "i386-windows" and (directory.parent / "x86_64-windows" / "d3d11.dll").is_file():
+            return directory.parent / "x86_64-windows"
+        for sub in ("x86_64-windows", "x64"):
+            if (directory / sub / "d3d11.dll").is_file():
+                return directory / sub
         if (directory / "d3d11.dll").is_file():
             return directory
-        if (directory / "x64" / "d3d11.dll").is_file():
-            return directory / "x64"
     return None
 
 
@@ -265,6 +282,9 @@ def ensure_prefix(wine: Path, prefix: Path, winver: str) -> None:
     if not system.is_file():
         log(f"creating prefix {prefix}")
         subprocess.run([str(wine), "wineboot", "--init"], env=env, check=False)
+    if prefix_incomplete(prefix):
+        log("prefix looks incomplete (no services registered); running wineboot -u")
+        subprocess.run([str(wine), "wineboot", "-u"], env=env, check=False)
     version_file = prefix.parent / "version"
     stamp = f"keel-{VERSION}-win{winver}"
     if version_file.is_file() and version_file.read_text(encoding="utf-8").strip() == stamp:
@@ -276,6 +296,80 @@ def ensure_prefix(wine: Path, prefix: Path, winver: str) -> None:
         check=False,
     )
     version_file.write_text(stamp + "\n", encoding="utf-8")
+
+
+MAC_DRIVER_KEY = r"HKCU\Software\Wine\Mac Driver"
+
+
+def apply_retina(wine: Path, prefix: Path, enabled: bool) -> None:
+    """Set winemac RetinaMode so games see native pixels, not scaled points. Idempotent."""
+    want = "y" if enabled else "n"
+    user_reg = prefix / "user.reg"
+    try:
+        text = user_reg.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        text = ""
+    section = "[Software\\\\Wine\\\\Mac Driver]"
+    if section in text:
+        block = text.split(section, 1)[1].split("\n[", 1)[0]
+        if f'"RetinaMode"="{want}"' in block:
+            return
+    log(f"setting Mac Driver RetinaMode={want}")
+    subprocess.run(
+        [str(wine), "reg", "add", MAC_DRIVER_KEY, "/v", "RetinaMode", "/d", want, "/f"],
+        env=wine_env(wine, prefix),
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def prefix_incomplete(prefix: Path) -> bool:
+    """A wineboot that was killed part-way leaves no service keys (RpcSs, nsiproxy...)."""
+    try:
+        text = (prefix / "system.reg").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return "\\\\Services\\\\RpcSs]" not in text
+
+
+def reg_value_is(prefix: Path, hive: str, section: str, entry: str) -> bool:
+    try:
+        text = (prefix / hive).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    marker = "[" + section.replace("\\", "\\\\") + "]"
+    if marker not in text:
+        return False
+    block = text.split(marker, 1)[1].split("\n[", 1)[0]
+    return entry in block
+
+
+def apply_dpi(wine: Path, prefix: Path, dpi: str) -> None:
+    """Set Wine's LogPixels (96 = 100%). Idempotent; empty leaves the prefix alone."""
+    if not dpi.isdigit() or not 48 <= int(dpi) <= 480:
+        if dpi:
+            log(f"ignoring KEEL_DPI={dpi!r} (want 48-480)")
+        return
+    entry = f'"LogPixels"=dword:{int(dpi):08x}'
+    targets = [
+        ("user.reg", "Control Panel\\Desktop", r"HKCU\Control Panel\Desktop"),
+        ("system.reg", "System\\CurrentControlSet\\Hardware Profiles\\Current\\Software\\Fonts",
+         r"HKLM\System\CurrentControlSet\Hardware Profiles\Current\Software\Fonts"),
+    ]
+    env = wine_env(wine, prefix)
+    for hive, section, key in targets:
+        if hive == "system.reg":
+            # CurrentControlSet is a link; Wine stores it under ControlSet001
+            if reg_value_is(prefix, hive, section.replace("CurrentControlSet", "ControlSet001"), entry):
+                continue
+        elif reg_value_is(prefix, hive, section, entry):
+            continue
+        log(f"setting LogPixels={dpi} in {key}")
+        subprocess.run(
+            [str(wine), "reg", "add", key, "/v", "LogPixels", "/t", "REG_DWORD", "/d", dpi, "/f"],
+            env=env, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
 
 
 def stage_native_dlls(prefix: Path, directory: Path) -> None:
@@ -291,6 +385,108 @@ def stage_native_dlls(prefix: Path, directory: Path) -> None:
         log(f"staged {dll.name}")
 
 
+BRIDGE_STEAM_DIR = r"C:\Program Files (x86)\Steam"
+
+
+def helpers_dir() -> Path:
+    return tool_dir() / "helpers"
+
+
+def runner_root(wine: Path) -> Path:
+    """<prefix>/bin/wine -> <prefix>; follows the lib/wine/x86_64-unix/wine symlink layout too."""
+    root = wine.parent.parent
+    if (root / "lib" / "wine").is_dir():
+        return root
+    resolved = wine.resolve()
+    for parent in resolved.parents:
+        if (parent / "lib" / "wine").is_dir():
+            return parent
+    return root
+
+
+def graphics_runner(graphics: str) -> tuple[Path | None, str]:
+    """Runner variant for the graphics backend (KEEL_WINE_DXMT / KEEL_WINE_D3DMETAL), if set."""
+    key = {"dxmt": "KEEL_WINE_DXMT", "d3dmetal": "KEEL_WINE_D3DMETAL"}.get(graphics)
+    if not key:
+        return None, ""
+    raw = os.environ.get(key, "")
+    if not raw:
+        return None, ""
+    path = Path(raw).expanduser()
+    if executable(path):
+        return path, key
+    log(f"{key}={raw} is not executable; ignoring")
+    return None, ""
+
+
+def runner_has_dxmt(wine: Path) -> bool:
+    lib = runner_root(wine) / "lib" / "wine"
+    return (lib / "x86_64-windows" / "winemetal.dll").is_file() and \
+        (lib / "x86_64-unix" / "winemetal.so").is_file()
+
+
+def ensure_winemetal(prefix: Path, wine: Path) -> None:
+    """DXMT's d3d11/dxgi import winemetal.dll; Wine needs a system32 placeholder to load it."""
+    source = runner_root(wine) / "lib" / "wine" / "x86_64-windows" / "winemetal.dll"
+    target = prefix / "drive_c" / "windows" / "system32" / "winemetal.dll"
+    if target.is_file() and target.stat().st_size == source.stat().st_size:
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, target)
+    log("staged system32/winemetal.dll")
+
+
+def bridge_files(wine: Path) -> tuple[Path, Path]:
+    lib = runner_root(wine) / "lib" / "wine"
+    return lib / "x86_64-windows" / "lsteamclient.dll", lib / "x86_64-unix" / "lsteamclient.so"
+
+
+def bridge_problems(wine: Path | None) -> list[str]:
+    problems: list[str] = []
+    if wine is None:
+        return ["no Wine runner (set KEEL_WINE to a Wine 11 build with lsteamclient)"]
+    dll, so = bridge_files(wine)
+    if not dll.is_file():
+        problems.append(f"missing {dll}")
+    if not so.is_file():
+        problems.append(f"missing {so}")
+    if not (helpers_dir() / "keel_steam.exe").is_file():
+        problems.append(f"missing {helpers_dir() / 'keel_steam.exe'}")
+    if not mac_steamclient().is_file():
+        problems.append(f"missing {mac_steamclient()}")
+    return problems
+
+
+def mac_steamclient() -> Path:
+    forced = os.environ.get("KEEL_STEAMCLIENT_DYLIB", "")
+    if forced:
+        return Path(forced).expanduser()
+    return (Path.home() / "Library" / "Application Support" / "Steam" / "Steam.AppBundle"
+            / "Steam" / "Contents" / "MacOS" / "steamclient.dylib")
+
+
+def dyld_paths() -> list[str]:
+    raw = os.environ.get("KEEL_DYLD_PATH", "")
+    paths = [p for p in raw.split(":") if p] if raw else [str(Path.home() / "opt" / "cxdeps-x86" / "lib")]
+    return [str(Path(p).expanduser()) for p in paths]
+
+
+def copy_if_changed(source: Path, target: Path) -> None:
+    if target.is_file() and target.stat().st_size == source.stat().st_size \
+            and target.stat().st_mtime >= source.stat().st_mtime:
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, target)
+    log(f"staged {target.name}")
+
+
+def stage_bridge(prefix: Path, wine: Path) -> None:
+    steam_dir = prefix / "drive_c" / "Program Files (x86)" / "Steam"
+    dll, _ = bridge_files(wine)
+    copy_if_changed(dll, steam_dir / "steamclient64.dll")
+    copy_if_changed(helpers_dir() / "keel_steam.exe", steam_dir / "keel_steam.exe")
+
+
 def resolve_graphics(requested: str) -> str:
     if requested != "auto":
         return requested
@@ -300,8 +496,9 @@ def resolve_graphics(requested: str) -> str:
 def dll_overrides(graphics: str, extra: str) -> str:
     table = {
         "dxmt": "d3d11,dxgi,d3d10core=n,b",
+        "dxmt-runner": "d3d11,dxgi,d3d10core,winemetal=b",
         "dxvk": "d3d11,dxgi,d3d10core,d3d9=n,b",
-        "d3dmetal": "d3d11,dxgi,d3d12=b",
+        "d3dmetal": "d3d11,dxgi,d3d12,d3d10=b",
         "wined3d": "d3d11,dxgi,d3d12,d3d9=b",
     }
     parts = [table[graphics]] if graphics in table else []
@@ -356,7 +553,10 @@ def prepare_and_launch(argv: list[str], applied: dict[str, str]) -> int:
     extra_dll = conf_get(applied, "KEEL_DLL", "dll", "")
     extra_args = conf_get(applied, "KEEL_ARGS", "args", "")
 
-    wine = find_runner(runner_name)
+    variant, variant_key = graphics_runner(graphics)
+    wine = variant if variant is not None else find_runner(runner_name)
+    dxmt_runner = graphics == "dxmt" and variant is not None and runner_has_dxmt(variant)
+    dry_run = os.environ.get("KEEL_DRY_RUN", "") == "1"
     prefix = prefix_path()
     if steamworks == "prefix" and steam_exe_path().is_file():
         prefix = steam_client_prefix()
@@ -371,18 +571,68 @@ def prepare_and_launch(argv: list[str], applied: dict[str, str]) -> int:
         for candidate in family_candidates(runner_name):
             log(f"  missing {candidate}")
         return 1
-    log(f"wine: {wine}")
+    log(f"wine: {wine} ({'from ' + variant_key if variant_key else 'KEEL_WINE/runner'})")
     log(f"prefix: {prefix}")
 
+    bridge = steamworks == "bridge"
+    if bridge:
+        problems = bridge_problems(wine)
+        if problems:
+            log("steamworks=bridge is not ready:")
+            for problem in problems:
+                log(f"  {problem}")
+            return 1
+        extra = dyld_paths()
+        current = [p for p in os.environ.get("DYLD_FALLBACK_LIBRARY_PATH", "").split(":") if p]
+        fallback = extra + [p for p in current if p not in extra]
+        for default in ("/usr/local/lib", "/usr/lib"):
+            if default not in fallback:
+                fallback.append(default)
+        os.environ["DYLD_FALLBACK_LIBRARY_PATH"] = ":".join(fallback)
+        aid_env = appid()
+        if aid_env:
+            os.environ.setdefault("SteamAppId", aid_env)
+            os.environ.setdefault("SteamGameId", aid_env)
+
+    if dry_run:
+        if graphics == "dxmt" and dxmt_runner:
+            backend = "runner builtins (d3d11,dxgi,d3d10core=b) + system32/winemetal.dll"
+        elif graphics == "dxmt":
+            backend = f"native staging from {dxmt_dll_dir()}"
+        else:
+            backend = dll_overrides(graphics, "")
+        overrides = dll_overrides("dxmt-runner" if dxmt_runner else graphics, extra_dll)
+        if bridge:
+            overrides = ";".join(part for part in (overrides, "steamclient64=n,b") if part)
+        launch = list(command) + (extra_args.split() if extra_args else [])
+        if bridge:
+            launch = [BRIDGE_STEAM_DIR + r"\keel_steam.exe", *launch]
+        log(f"dry run: graphics={graphics} via {backend}")
+        log(f"dry run: WINEDLLOVERRIDES={overrides}")
+        log("dry run: command: " + " ".join([str(wine), *launch]))
+        log("dry run: no prefix changes, Wine not started")
+        return 0
+
     ensure_prefix(wine, prefix, winver)
+    retina = conf_get(applied, "KEEL_RETINA", "retina", "1")
+    if retina in ("0", "1"):
+        apply_retina(wine, prefix, retina == "1")
+    apply_dpi(wine, prefix, conf_get(applied, "KEEL_DPI", "dpi", ""))
     env = wine_env(wine, prefix)
     if esync == "1":
         env["WINEESYNC"] = "1"
+        # CrossOver-derived runners (incl. Keel's Wine 11 build) implement fast sync as
+        # mach-port "msync"; without it every wait/event is a wineserver round trip
+        # (~8 us vs ~0.1 us), which starves multithreaded video decoders (P5R's CRI Mana).
+        env.setdefault("WINEMSYNC", "1")
     env["ROSETTA_ADVERTISE_AVX"] = "1"
     env["MTL_HUD_ENABLED"] = "1" if hud == "1" else "0"
     env["DXMT_LOG_LEVEL"] = "info" if hud == "1" else "none"
 
-    if graphics == "dxmt":
+    if graphics == "dxmt" and dxmt_runner:
+        ensure_winemetal(prefix, wine)
+        log(f"dxmt: runner builtins ({runner_root(wine)})")
+    elif graphics == "dxmt":
         dlls = dxmt_dll_dir()
         if dlls is None:
             log("DXMT not installed; falling back to WineD3D. Run: keel fetch-dxmt")
@@ -400,7 +650,13 @@ def prepare_and_launch(argv: list[str], applied: dict[str, str]) -> int:
     elif graphics == "d3dmetal":
         log("D3DMetal uses the runner's builtin. CrossOver or Game Porting Toolkit is required.")
 
-    env["WINEDLLOVERRIDES"] = dll_overrides(graphics, extra_dll)
+    overrides = dll_overrides("dxmt-runner" if dxmt_runner else graphics, extra_dll)
+    if bridge:
+        stage_bridge(prefix, wine)
+        overrides = ";".join(part for part in (overrides, "steamclient64=n,b") if part)
+        log(f"steamworks: bridge (lsteamclient -> {mac_steamclient()})")
+        log(f"DYLD_FALLBACK_LIBRARY_PATH={env.get('DYLD_FALLBACK_LIBRARY_PATH', '')}")
+    env["WINEDLLOVERRIDES"] = overrides
 
     launch = list(command)
     aid = appid()
@@ -414,10 +670,25 @@ def prepare_and_launch(argv: list[str], applied: dict[str, str]) -> int:
             log("steamworks=prefix but Windows Steam is not installed. Run: keel setup-steam")
     if extra_args:
         launch.extend(extra_args.split())
+    if bridge:
+        launch = [BRIDGE_STEAM_DIR + r"\keel_steam.exe", *launch]
 
     log("command: " + " ".join(launch))
-    proc = subprocess.Popen([str(wine), *launch], env=env)
-    code = proc.wait()
+    wine_log_setting = conf_get(applied, "KEEL_WINE_LOG", "wine_log", "1")
+    wine_log = None
+    if wine_log_setting == "1" and os.environ.get("STEAM_COMPAT_DATA_PATH"):
+        log_path = Path(os.environ["STEAM_COMPAT_DATA_PATH"]) / "wine.log"
+        try:
+            wine_log = open(log_path, "w", encoding="utf-8")
+            log(f"wine output: {log_path} (WINEDEBUG={env.get('WINEDEBUG', '')})")
+        except OSError:
+            wine_log = None
+    try:
+        proc = subprocess.Popen([str(wine), *launch], env=env, stdout=wine_log, stderr=wine_log)
+        code = proc.wait()
+    finally:
+        if wine_log is not None:
+            wine_log.close()
     wineserver = wine.parent / "wineserver"
     if executable(wineserver):
         subprocess.run([str(wineserver), "-w"], env=env, check=False)
@@ -502,7 +773,10 @@ def fetch_dxmt() -> int:
     else:
         with tarfile.open(archive_path, "r:*") as archive:
             safe_extract(archive, extract_root)
-    dll = next(extract_root.rglob("d3d11.dll"), None)
+    found = sorted(extract_root.rglob("d3d11.dll"))
+    dll = next((d for d in found if d.parent.name in ("x86_64-windows", "x64")), None)
+    if dll is None:
+        dll = next((d for d in found if "i386" not in str(d) and "x32" not in str(d)), found[0] if found else None)
     if dll is None:
         log("archive did not contain d3d11.dll")
         return 1
@@ -545,13 +819,74 @@ def doctor() -> int:
         f"Windows depot switch: {'on' if switch else 'off'}",
         f"Python: {sys.version.split()[0]}",
     ]
-    for name in ("crossover", "gptk", "whisky", "wine"):
-        found = find_runner(name)
-        lines.append(f"{name}: {found if found else 'not found'}")
+    forced = os.environ.get("KEEL_WINE", "")
+    if forced:
+        ok = forced_runner() is not None
+        lines.append(f"KEEL_WINE (forces every launch): {forced}{'' if ok else '  [NOT EXECUTABLE]'}")
+    saved = os.environ.pop("KEEL_WINE", None)
+    try:
+        for name in ("crossover", "gptk", "whisky", "wine"):
+            found = find_runner(name)
+            lines.append(f"{name}: {found if found else 'not found'}")
+    finally:
+        if saved is not None:
+            os.environ["KEEL_WINE"] = saved
+    problems = bridge_problems(find_runner("auto"))
+    lines.append("Steamworks bridge: " + ("ready" if not problems else "not ready"))
+    for problem in problems:
+        lines.append(f"  {problem}")
     dlls = dxmt_dll_dir()
     lines.append(f"DXMT: {dlls if dlls else 'not installed (keel fetch-dxmt)'}")
+    apps = sorted((support_dir() / "apps").glob("*.conf"))
+    if apps:
+        lines.append("Per-app graphics:")
+    for conf in apps:
+        values = load_conf(conf)
+        graphics = values.get("KEEL_GRAPHICS", values.get("graphics", "auto (default)"))
+        line = f"  {conf.stem}: {graphics}"
+        variant = values.get({"dxmt": "KEEL_WINE_DXMT", "d3dmetal": "KEEL_WINE_D3DMETAL"}.get(graphics, ""), "")
+        if variant:
+            line += f"  runner {variant}"
+        lines.append(line)
     text = "\n".join(lines)
     print(text)
+    return 0
+
+
+GRAPHICS_CHOICES = ("d3dmetal", "dxmt", "dxvk", "wined3d", "auto")
+
+
+def graphics_command(argv: list[str]) -> int:
+    if len(argv) < 3 or not argv[2].isdigit():
+        sys.stderr.write("usage: keel graphics <appid> [" + "|".join(GRAPHICS_CHOICES) + "]\n")
+        return 1
+    conf = support_dir() / "apps" / f"{argv[2]}.conf"
+    values = load_conf(conf)
+    if len(argv) < 4:
+        print(values.get("KEEL_GRAPHICS", values.get("graphics", "auto")))
+        return 0
+    choice = argv[3].lower()
+    if choice not in GRAPHICS_CHOICES:
+        sys.stderr.write(f"unknown backend {choice}; choose one of {', '.join(GRAPHICS_CHOICES)}\n")
+        return 1
+    lines = conf.read_text(encoding="utf-8").splitlines() if conf.is_file() else []
+    backup = conf.with_name(conf.name + ".bak")
+    if conf.is_file() and not backup.exists():
+        shutil.copy2(conf, backup)
+    out, done = [], False
+    for line in lines:
+        key = line.split("=", 1)[0].strip() if "=" in line and not line.lstrip().startswith("#") else ""
+        if key in ("KEEL_GRAPHICS", "graphics"):
+            if not done:
+                out.append(f"KEEL_GRAPHICS={choice}")
+                done = True
+            continue
+        out.append(line)
+    if not done:
+        out.append(f"KEEL_GRAPHICS={choice}")
+    conf.parent.mkdir(parents=True, exist_ok=True)
+    conf.write_text("\n".join(out) + "\n", encoding="utf-8")
+    print(f"{argv[2]}: KEEL_GRAPHICS={choice}  ({conf})")
     return 0
 
 
@@ -576,6 +911,8 @@ def main(argv: list[str]) -> int:
     if verb == "doctor":
         apply_config()
         return doctor()
+    if verb == "graphics":
+        return graphics_command(argv)
     if verb == "fetch-dxmt":
         return fetch_dxmt()
     if verb == "setup-steam":
