@@ -1,0 +1,26 @@
+--- a/dlls/winemac.drv/cocoa_window.m
++++ b/dlls/winemac.drv/cocoa_window.m
+@@ -982,7 +982,11 @@
+ 
+     - (CALayer*) makeBackingLayer
+     {
++#if defined(__x86_64__)
+         CAMetalLayer *layer = [WineMetalLayer layer];   /* CW HACK 22435 */
++#else
++        CAMetalLayer *layer = [CAMetalLayer layer];
++#endif
+         layer.device = _device;
+         layer.framebufferOnly = YES;
+         layer.magnificationFilter = kCAFilterNearest;
+--- a/dlls/winemac.drv/event.c
++++ b/dlls/winemac.drv/event.c
+@@ -400,7 +400,9 @@
+         macdrv_app_quit_requested(event);
+         break;
+     case CLIENT_SURFACE_PRESENTED:    /* CW HACK 22435 */
++#ifdef __x86_64__
+ 	macdrv_client_surface_presented(event);
++#endif
+ 	break;
+     case DISPLAYS_CHANGED:
+         macdrv_displays_changed(event);
