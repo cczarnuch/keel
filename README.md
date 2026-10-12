@@ -123,9 +123,10 @@ KEEL_GRAPHICS=dxmt "/Users/you/Library/Application Support/Steam/compatibilityto
 | Xcode Command Line Tools (clang for `keel-launch`, python3) | installer / `keel setup-bridge` opens `xcode-select --install` |
 | `keel_steam.exe` helper, `keel-launch` | installer |
 | DXMT release | installer dialog / `keel fetch-dxmt` |
-| x86_64 Wine 11 runner with lsteamclient and the patches in `wine-patches/` | **manual**: `docs/RUNNERS.md` §1 |
+| CrossOver 26 (Wine 11) sources with `wine-patches/` applied | `keel fetch-crossover-src [version]` (offered by `keel setup-bridge`) |
+| x86_64 Wine 11 runner with lsteamclient and the patches in `wine-patches/` | **manual** build: `docs/RUNNERS.md` §1 |
 | x86_64 dylibs (freetype, gnutls…) in `KEEL_DYLD_PATH` | **manual**: `docs/RUNNERS.md` §0 |
 | D3DMetal copied from Apple's Game Porting Toolkit | **manual**: `docs/RUNNERS.md` §2 |
 | DXMT runner clone (optional) | **manual**: `docs/RUNNERS.md` §3 |
 
-`keel setup-bridge` (and `keel doctor`) prints exactly which of these are missing.
+`keel setup-bridge` (and `keel doctor`) prints exactly which of these are missing, including whether the CrossOver sources at `KEEL_CX_SRC` (default `~/Downloads/sources`) are present and patched.

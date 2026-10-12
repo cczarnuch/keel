@@ -9,7 +9,7 @@ All paths below are defaults from `build/env.sh`; override them via environment 
 - Use `/usr/bin/clang -arch x86_64`. llvm-mingw's clang must not come first on PATH, or `ld: library 'System' not found`.
 
 ## 1. Wine
-1. Apply `wine-patches/` (see its README).
+1. Get the sources and apply `wine-patches/`: `keel fetch-crossover-src [version]` (default 26.3.0, the Wine 11 based CrossOver release). It downloads `https://media.codeweavers.com/pub/crossover/source/crossover-sources-<version>.tar.gz` (resumable) into `~/Library/Caches/Keel` (`KEEL_CACHE_DIR`), checks it with `tar -tzf` and prints its sha256 (CodeWeavers publishes none), unpacks it to `$KEEL_CX_SRC` (default `~/Downloads/sources`; the Wine tree is `wine/`), then applies 0001–0006 with `patch -p1`, skipping ones already applied. For 0003 it copies `lsteamclient/` from `$KEEL_PROTON_SRC` (default `~/src/proton`, Proton `proton_11.0` @ `bc89621`) first. Re-running is safe. `KEEL_DRY_RUN=1` only prints the plan. To do it by hand, see `wine-patches/README.md`.
 2. `build/reconf.sh`, then run `build/runmake.sh` detached (see header comment), then `make install`.
 3. `make install` may skip `bin/wine`: `ln -s ../lib/wine/x86_64-unix/wine "$PREFIX/bin/wine"`.
 4. `build/build-lsc-unix.sh`, plus `make dlls/lsteamclient/x86_64-windows/lsteamclient.dll`. Copy `lsteamclient.dll` → `$PREFIX/lib/wine/x86_64-windows/` and `lsteamclient.so` → `$PREFIX/lib/wine/x86_64-unix/`.
