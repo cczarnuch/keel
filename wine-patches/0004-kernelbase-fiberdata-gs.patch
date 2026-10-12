@@ -1,0 +1,48 @@
+--- a/dlls/kernelbase/thread.c
++++ b/dlls/kernelbase/thread.c
+@@ -855,6 +855,18 @@
+     return set_ntstatus( RtlWow64SetThreadContext( handle, context ));
+ #else
+     return set_ntstatus( STATUS_NOT_IMPLEMENTED );
++#endif
++}
++
++
++/* Keel: games inline GetCurrentFiber() as "mov %gs:0x20". On macOS x86_64 the gs base is the
++ * pthread TSD, not the TEB (only Self/TLS/Peb are mirrored), so mirror FiberData there too.
++ * On platforms where gs points at the TEB this writes the same field and is harmless. */
++static inline void set_teb_fiber_data( void *fiber )
++{
++    NtCurrentTeb()->Tib.FiberData = fiber;
++#ifdef __x86_64__
++    __asm__ volatile ( "movq %0,%%gs:0x20" :: "r" (fiber) : "memory" );
+ #endif
+ }
+ 
+@@ -1155,7 +1167,7 @@
+     if (fiber)
+     {
+         relocate_thread_actctx_stack( &NtCurrentTeb()->ActivationContextStack );
+-        NtCurrentTeb()->Tib.FiberData = NULL;
++        set_teb_fiber_data( NULL );
+         HeapFree( GetProcessHeap(), 0, fiber );
+     }
+     return TRUE;
+@@ -1217,7 +1229,7 @@
+     fiber->flags            = flags;
+     fiber->fls_slots        = NtCurrentTeb()->FlsSlots;
+     relocate_thread_actctx_stack( &fiber->actctx.stack_space );
+-    NtCurrentTeb()->Tib.FiberData = fiber;
++    set_teb_fiber_data( fiber );
+     return fiber;
+ }
+ 
+@@ -1267,7 +1279,7 @@
+     /* stack_allocation and stack_base never change */
+ 
+     /* FIXME: should save floating point context if requested in fiber->flags */
+-    NtCurrentTeb()->Tib.FiberData     = new_fiber;
++    set_teb_fiber_data( new_fiber );
+     NtCurrentTeb()->Tib.ExceptionList = new_fiber->except;
+     NtCurrentTeb()->Tib.StackBase     = new_fiber->stack_base;
+     NtCurrentTeb()->Tib.StackLimit    = new_fiber->stack_limit;

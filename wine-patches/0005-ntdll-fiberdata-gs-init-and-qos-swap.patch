@@ -1,0 +1,73 @@
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -1812,6 +1812,10 @@
+                    "1:\tmovq %rdi,%rsp\n\t"    /* user_rsp */
+                    "movq 0x98(%r14),%rbp\n\t"  /* prev_frame->rbp */
+                    "ldmxcsr 0xd8(%r14)\n\t"    /* prev_frame->xsave.MxCsr */
++#ifdef __APPLE__
++                   "movq 0x20(%r13),%rax\n\t"     /* teb->Tib.FiberData -> %gs:0x20 (Keel) */
++                   "movq %rax,%gs:0x20\n\t"
++#endif
+ #ifdef __linux__
+                    "movw 0x338(%r13),%ax\n"    /* amd64_thread_data()->fs */
+                    "testw %ax,%ax\n\t"
+@@ -3076,6 +3080,9 @@
+     __asm__ volatile ("movq %0,%%gs:%c1" :: "r" (teb->Tib.Self), "n" (FIELD_OFFSET(TEB, Tib.Self)));
+     __asm__ volatile ("movq %0,%%gs:%c1" :: "r" (teb->ThreadLocalStoragePointer), "n" (FIELD_OFFSET(TEB, ThreadLocalStoragePointer)));
+     __asm__ volatile ("movq %0,%%gs:%c1" :: "r" (teb->Peb), "n" (FIELD_OFFSET(TEB, Peb)));
++    /* Keel: games inline GetCurrentFiber() as "mov %gs:0x20" and test it against NULL to tell
++       fibers from plain threads. That slot otherwise holds libpthread's QoS value here. */
++    __asm__ volatile ("movq %0,%%gs:%c1" :: "r" (teb->Tib.FiberData), "n" (FIELD_OFFSET(TEB, Tib.FiberData)));
+     thread_data->pthread_teb = mac_thread_gsbase();
+     /* alloc_tls_slot() needs to poke a value to an address relative to each
+        thread's gsbase.  Have each thread record its gsbase pointer into its
+@@ -3296,6 +3303,13 @@
+                    "leaq -0x98(%rbp),%rcx\n"
+                    "2:\n\t"
+ #endif
++#ifdef __APPLE__
++                   /* Keel: %gs:0x20 is libpthread's QoS TSD slot on macOS but holds the Windows
++                    * FiberData while in PE code; libsystem propagates that slot as the thread
++                    * priority in mach messages (configd crashed adopting a fiber pointer).
++                    * Clear it while running Unix code. */
++                   "movq $0,%gs:0x20\n\t"
++#endif
+                    "ldmxcsr 0x33c(%r13)\n\t"       /* amd64_thread_data()->mxcsr */
+                    "movl 0xb0(%rcx),%eax\n\t"      /* frame->syscall_id */
+                    "movq 0x18(%rcx),%r11\n\t"      /* 2nd argument */
+@@ -3335,6 +3349,10 @@
+                    __ASM_CFI(".cfi_remember_state\n\t")
+                    __ASM_CFI_CFA_IS_AT2(rcx, 0xa8, 0x01) /* frame->syscall_cfa */
+                    "leaq 0x70(%rcx),%rsp\n\t"      /* %rsp > frame means no longer inside syscall */
++#ifdef __APPLE__
++                   "movq 0x20(%r13),%rdx\n\t"     /* teb->Tib.FiberData -> %gs:0x20 (Keel) */
++                   "movq %rdx,%gs:0x20\n\t"
++#endif
+ #ifdef __linux__
+                    "movw 0x338(%r13),%dx\n"        /* amd64_thread_data()->fs */
+                    "testw %dx,%dx\n\t"
+@@ -3583,6 +3601,13 @@
+                    "mov $158,%eax\n\t"             /* SYS_arch_prctl */
+                    "syscall\n\t"
+                    "2:\n\t"
++#endif
++#ifdef __APPLE__
++                   /* Keel: %gs:0x20 is libpthread's QoS TSD slot on macOS but holds the Windows
++                    * FiberData while in PE code; libsystem propagates that slot as the thread
++                    * priority in mach messages (configd crashed adopting a fiber pointer).
++                    * Clear it while running Unix code. */
++                   "movq $0,%gs:0x20\n\t"
+ #endif
+                    "ldmxcsr 0x33c(%r13)\n\t"       /* amd64_thread_data()->mxcsr */
+                    "movq %r8,%rdi\n\t"             /* args */
+@@ -3604,6 +3629,10 @@
+                    /* switch to user stack */
+                    "movq 0x88(%rcx),%rsp\n\t"
+                    __ASM_CFI(".cfi_restore_state\n\t")
++#ifdef __APPLE__
++                   "movq 0x20(%r13),%rdx\n\t"     /* teb->Tib.FiberData -> %gs:0x20 (Keel) */
++                   "movq %rdx,%gs:0x20\n\t"
++#endif
+ #ifdef __linux__
+                    "movw 0x338(%r13),%dx\n"        /* amd64_thread_data()->fs */
+                    "testw %dx,%dx\n\t"
