@@ -6,6 +6,7 @@ through Keel's bridge mode on an Apple Silicon Mac. All numbers were measured on
 ## Steam integration
 - **Launch options don't expand `$HOME`.** Steam fails with OS Error 260; write the full path.
 - **Mac Steam won't exec a script as the launch target** (OS Error 0). Keel ships `keel-launch`, a tiny compiled launcher (`helpers/keel-launch.c`) that execs `/usr/bin/python3 keel`. Keel therefore runs on the system Python 3.9.
+- An alternative was tried on `main`: starting Launch Options with `/bin/bash keel-launch` (a bash script). Keel keeps the compiled launcher instead. It's tested end-to-end with Steam, and it calls `/usr/bin/python3` by full path, so it doesn't depend on Steam's bare `PATH`.
 - Mac Steam has no Compatibility menu, so Keel works through Launch Options (`keel-launch waitforexitandrun %command%`). An env prefix (`KEEL_GRAPHICS=dxmt …`) works and beats the per-app conf.
 - **Denuvo** allows about 5 activations per 24 h. Each new prefix or Wine/hardware change may cost one. Debug with test programs and dry runs (`KEEL_DRY_RUN=1`), not game launches.
 
