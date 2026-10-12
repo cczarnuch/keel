@@ -114,3 +114,18 @@ KEEL_GRAPHICS=dxmt "/Users/you/Library/Application Support/Steam/compatibilityto
 
 `KEEL_DRY_RUN=1` logs the runner, overrides and command, then exits without touching the prefix or starting Wine.
 `keel doctor` lists per-app graphics.
+
+## Bridge mode requirements
+
+| Requirement | Installed by |
+|---|---|
+| Rosetta 2 | installer dialog / `keel setup-bridge` (`softwareupdate --install-rosetta`) |
+| Xcode Command Line Tools (clang for `keel-launch`, python3) | installer / `keel setup-bridge` opens `xcode-select --install` |
+| `keel_steam.exe` helper, `keel-launch` | installer |
+| DXMT release | installer dialog / `keel fetch-dxmt` |
+| x86_64 Wine 11 runner with lsteamclient and the patches in `wine-patches/` | **manual**: `docs/RUNNERS.md` §1 |
+| x86_64 dylibs (freetype, gnutls…) in `KEEL_DYLD_PATH` | **manual**: `docs/RUNNERS.md` §0 |
+| D3DMetal copied from Apple's Game Porting Toolkit | **manual**: `docs/RUNNERS.md` §2 |
+| DXMT runner clone (optional) | **manual**: `docs/RUNNERS.md` §3 |
+
+`keel setup-bridge` (and `keel doctor`) prints exactly which of these are missing.

@@ -84,6 +84,22 @@ if command -v python3 >/dev/null 2>&1; then
   PY="$(command -v python3)"
 fi
 
+# Bridge mode (and every x86_64 Windows game) needs Rosetta 2.
+if ! /usr/bin/arch -x86_64 /usr/bin/true >/dev/null 2>&1; then
+  ROSETTA="$(osascript <<'APPLESCRIPT' || true
+set theButton to button returned of (display dialog "Windows games run as x86_64 under Rosetta 2, which is not installed. Install it now? (Apple's license applies.)" buttons {"Skip", "Install Rosetta"} default button "Install Rosetta" with title "Keel")
+return theButton
+APPLESCRIPT
+)"
+  if [ "$ROSETTA" = "Install Rosetta" ]; then
+    /usr/sbin/softwareupdate --install-rosetta --agree-to-license || say "Rosetta install failed. Retry with: softwareupdate --install-rosetta --agree-to-license"
+  fi
+fi
+if [ ! -x "$DEST/keel-launch" ]; then
+  say "keel-launch could not be built because clang is missing. Install Xcode Command Line Tools (a Mac dialog opens), then run this installer again. Until then, Launch Options uses /usr/bin/python3 directly."
+  xcode-select --install >/dev/null 2>&1 || true
+fi
+
 if [ -n "$PY" ]; then
   FETCH="$(osascript <<'APPLESCRIPT' || true
 set theButton to button returned of (display dialog "DirectX 11 games need DXMT, a free translator from D3D11 to Metal. Download the latest release now? It is stored in your Library folder, not inside Steam." buttons {"Skip", "Download DXMT"} default button "Download DXMT" with title "Keel")
@@ -97,7 +113,7 @@ APPLESCRIPT
   printf '%s\n' "$REPORT" > /tmp/keel-doctor.txt
   osascript <<'APPLESCRIPT' || true
 set report to read POSIX file "/tmp/keel-doctor.txt"
-display dialog report buttons {"OK"} default button "OK" with title "Keel doctor"
+display dialog report & return & "Bridge mode needs an x86_64 Wine 11 runner you build yourself (see docs/RUNNERS.md). Check anytime with: keel setup-bridge" buttons {"OK"} default button "OK" with title "Keel doctor"
 APPLESCRIPT
 else
   say "Keel is installed, but Python 3 was not found. Game launches need it. Install Xcode Command Line Tools (a Mac dialog) and run this installer again."

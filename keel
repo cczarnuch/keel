@@ -36,6 +36,7 @@ Keel {version} — Steam Play for macOS
   keel fetch-dxmt                          download DXMT into Application Support
   keel doctor                              print what this Mac can run
   keel graphics <appid> [backend]          show or set KEEL_GRAPHICS for one game
+  keel setup-bridge [--yes]                check/install bridge-mode dependencies
 
   KEEL_STEAMWORKS=bridge  Proton-style lsteamclient bridge to Mac Steam (needs KEEL_WINE)
   KEEL_GRAPHICS=d3dmetal|dxmt|dxvk|wined3d|auto; KEEL_WINE_D3DMETAL / KEEL_WINE_DXMT
@@ -457,6 +458,95 @@ def bridge_problems(wine: Path | None) -> list[str]:
     return problems
 
 
+DEFAULT_RUNNER = Path.home() / "opt" / "wine-cx11-x86" / "bin" / "wine"
+DEFAULT_DXMT_RUNNER = Path.home() / "opt" / "wine-cx11-x86-dxmt" / "bin" / "wine"
+RUNNERS_DOC = "docs/RUNNERS.md (github.com/cczarnuch/keel)"
+
+
+def rosetta_installed() -> bool:
+    try:
+        return subprocess.run(["/usr/bin/arch", "-x86_64", "/usr/bin/true"],
+                              capture_output=True, timeout=20).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def clt_installed() -> bool:
+    try:
+        ok = subprocess.run(["/usr/bin/xcode-select", "-p"], capture_output=True, timeout=20).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return ok and Path("/usr/bin/clang").exists()
+
+
+def bridge_checklist() -> list[tuple[bool, str, str]]:
+    """(ok, item, how to fix) for everything bridge mode needs. Nothing here installs anything."""
+    items: list[tuple[bool, str, str]] = []
+    items.append((rosetta_installed(), "Rosetta 2",
+                  "keel setup-bridge (or: softwareupdate --install-rosetta --agree-to-license)"))
+    items.append((clt_installed(), "Xcode Command Line Tools (clang, python3)", "xcode-select --install"))
+    items.append((mac_steamclient().is_file(), f"Mac Steam steamclient.dylib ({mac_steamclient()})",
+                  "install Steam for Mac and sign in once"))
+    items.append(((helpers_dir() / "keel_steam.exe").is_file(), "keel_steam.exe helper",
+                  "re-run Install Keel.command"))
+    raw = os.environ.get("KEEL_WINE", "")
+    wine = Path(raw).expanduser() if raw else DEFAULT_RUNNER
+    where = "KEEL_WINE" if raw else "default path"
+    items.append((executable(wine), f"x86_64 Wine 11 runner ({where}: {wine})",
+                  f"build it from source: {RUNNERS_DOC} section 1"))
+    if executable(wine):
+        dll, so = bridge_files(wine)
+        items.append((dll.is_file() and so.is_file(), "lsteamclient.dll + lsteamclient.so in the runner",
+                       f"build with wine-patches/0003 + build/build-lsc-unix.sh ({RUNNERS_DOC})"))
+        fw = runner_root(wine) / "lib" / "external" / "D3DMetal.framework"
+        items.append((fw.is_dir(), "D3DMetal (GPTK) in the runner",
+                       f"copy from Apple's Game Porting Toolkit: {RUNNERS_DOC} section 2"))
+    missing_libs = [name for name in ("libfreetype.6.dylib", "libgnutls.30.dylib")
+                    if not any((Path(d) / name).is_file() for d in dyld_paths())]
+    items.append((not missing_libs, "x86_64 runtime dylibs (" + ":".join(dyld_paths()) + ")",
+                  "missing " + ", ".join(missing_libs) + f"; set KEEL_DYLD_PATH or see {RUNNERS_DOC} section 0"
+                  if missing_libs else ""))
+    raw_dxmt = os.environ.get("KEEL_WINE_DXMT", "")
+    dxmt = Path(raw_dxmt).expanduser() if raw_dxmt else DEFAULT_DXMT_RUNNER
+    items.append((executable(dxmt) and runner_has_dxmt(dxmt), f"DXMT runner clone (optional; {dxmt})",
+                  f"cp -cR the runner and add DXMT builtins: {RUNNERS_DOC} section 3; keel fetch-dxmt downloads DXMT"))
+    items.append((True, "Wine patches (fiber/QoS, wininet cache)",
+                  "not detectable from binaries; make sure the runner was built with wine-patches/0004-0006"))
+    return items
+
+
+def checklist_lines(items: list[tuple[bool, str, str]]) -> list[str]:
+    lines = []
+    for ok, item, fix in items:
+        mark = "?" if item.startswith("Wine patches") else ("ok" if ok else "MISSING")
+        lines.append(f"  [{mark}] {item}")
+        if mark == "?":
+            lines.append(f"            -> {fix}")
+        if not ok and fix:
+            lines.append(f"            -> {fix}")
+    return lines
+
+
+def setup_bridge(argv: list[str]) -> int:
+    """Check bridge-mode dependencies and install the parts macOS can install for us."""
+    assume_yes = "--yes" in argv
+    if not rosetta_installed():
+        answer = "y" if assume_yes else (input("Rosetta 2 is not installed. Install it now? [y/N] ")
+                                         if sys.stdin.isatty() else "n")
+        if answer.strip().lower().startswith("y"):
+            subprocess.run(["/usr/sbin/softwareupdate", "--install-rosetta", "--agree-to-license"], check=False)
+    if not clt_installed():
+        print("Xcode Command Line Tools are missing; opening the macOS installer dialog.")
+        subprocess.run(["/usr/bin/xcode-select", "--install"], check=False)
+    items = bridge_checklist()
+    print("Steamworks bridge requirements:")
+    print("\n".join(checklist_lines(items)))
+    required = [item for item in items if not item[1].startswith("DXMT runner")]
+    ready = all(ok for ok, _, _ in required)
+    print("Bridge mode: " + ("ready" if ready else "NOT ready (the Wine runner must be built by hand; see " + RUNNERS_DOC + ")"))
+    return 0 if ready else 1
+
+
 def mac_steamclient() -> Path:
     forced = os.environ.get("KEEL_STEAMCLIENT_DYLIB", "")
     if forced:
@@ -835,6 +925,7 @@ def doctor() -> int:
     lines.append("Steamworks bridge: " + ("ready" if not problems else "not ready"))
     for problem in problems:
         lines.append(f"  {problem}")
+    lines.extend(checklist_lines(bridge_checklist()))
     dlls = dxmt_dll_dir()
     lines.append(f"DXMT: {dlls if dlls else 'not installed (keel fetch-dxmt)'}")
     apps = sorted((support_dir() / "apps").glob("*.conf"))
@@ -911,6 +1002,9 @@ def main(argv: list[str]) -> int:
     if verb == "doctor":
         apply_config()
         return doctor()
+    if verb == "setup-bridge":
+        apply_config()
+        return setup_bridge(argv)
     if verb == "graphics":
         return graphics_command(argv)
     if verb == "fetch-dxmt":
