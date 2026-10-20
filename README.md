@@ -21,7 +21,13 @@ The installer copies a finished line, with your path filled in, to the clipboard
 
 Mac Steam has no Compatibility section. Valve ships the Steam Play code and leaves the checkbox off. Dropping a tool in `compatibilitytools.d` does not create the menu. Keel does not inject into Steam to force it on. Launch Options is the path that still works after a Steam update.
 
-If a Windows-only game has no Install button, run the installer again and enable the Windows depot switch. That writes one line Valve already documents for developers, `@sSteamCmdForcePlatformType windows`, into `steam_dev.cfg`. While that line is there, Steam may prefer Windows depots even for games that have a Mac build. Remove it from the same file to undo.
+If a Windows-only game has no Install button, turn on the Windows depot switch just for that install: `keel platform windows`, restart Steam, install the game, then `keel platform mac` and restart Steam again. The switch is one line Valve documents for developers, `@sSteamCmdForcePlatformType windows`, in `steam_dev.cfg`. While it is on, Steam downloads Windows depots even for games that have a Mac build, so leave it off by default (the installer now defaults to "Not now"). `keel platform status` shows the current state.
+
+## Managing your library
+
+- `keel list` — table of installed games: installed build (Mac/Windows/both), store platforms (from Steam's public appdetails API, cached in `~/Library/Caches/Keel`; `--offline` uses only the cache), whether the Keel launch option is set, and a status: *Mac native*, *Windows via Keel*, *Windows, no Keel launch option (won't run)*, or *Mac build available but Windows installed* (reinstall with the switch off to get the Mac build).
+- `keel collection sync` — creates/updates a static Steam collection named **Keel** with every game that has the Keel launch option. Quit Steam first (it overwrites the file otherwise); `--dry-run` previews. The cloudstorage folder is backed up as `config/cloudstorage.keel-backup-<timestamp>` before writing. Not run automatically from the launcher (Steam is always running then), so rerun it after attaching new games.
+- `keel attach <appid>` / `keel detach <appid>` — set or remove the Keel launch option in `localconfig.vdf` (quit Steam first; a timestamped backup is kept).
 
 ## What has to already be on the Mac
 

@@ -22,7 +22,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.14.0"
+VERSION = "0.15.0"
 USAGE = """\
 Keel {version} — Steam Play for macOS
 
@@ -36,6 +36,10 @@ Keel {version} — Steam Play for macOS
   keel fetch-dxmt                          download DXMT into Application Support
   keel doctor                              print what this Mac can run
   keel graphics <appid> [backend]          show or set KEEL_GRAPHICS for one game
+  keel list [--offline]                    installed games: build, store platforms, Keel status
+  keel collection [sync] [--dry-run]       put Keel-attached games in a "Keel" Steam collection (quit Steam)
+  keel platform windows|mac|status         toggle Steam's Windows-depot switch (restart Steam)
+  keel attach|detach <appid>               set/remove Keel launch option (quit Steam)
   keel setup-bridge [--yes]                check/install bridge-mode dependencies
   keel fetch-crossover-src [version]       download, unpack and patch CodeWeavers' sources
 
@@ -1123,6 +1127,391 @@ def graphics_command(argv: list[str]) -> int:
     return 0
 
 
+# ---- Steam library helpers: list / collection / platform / attach ----------
+
+def steam_root() -> Path:
+    return Path.home() / "Library" / "Application Support" / "Steam"
+
+
+def steam_dev_cfg() -> Path:
+    return steam_root() / "Steam.AppBundle" / "Steam" / "Contents" / "MacOS" / "steam_dev.cfg"
+
+
+def steam_running() -> bool:
+    for name in ("steam_osx", "Steam"):
+        if subprocess.run(["pgrep", "-x", name], capture_output=True).returncode == 0:
+            return True
+    return False
+
+
+def steam_user_dirs() -> list[Path]:
+    base = steam_root() / "userdata"
+    if not base.is_dir():
+        return []
+    return sorted(p for p in base.iterdir() if p.name.isdigit() and (p / "config").is_dir())
+
+
+def vdf_tokens(text: str):
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c.isspace():
+            i += 1
+        elif c == "/" and text.startswith("//", i):
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+        elif c in "{}":
+            yield c
+            i += 1
+        elif c == '"':
+            j, out = i + 1, []
+            while j < n and text[j] != '"':
+                if text[j] == "\\" and j + 1 < n:
+                    out.append({"n": "\n", "t": "\t"}.get(text[j + 1], text[j + 1]))
+                    j += 2
+                    continue
+                out.append(text[j])
+                j += 1
+            yield "".join(out)
+            i = j + 1
+        else:
+            j = i
+            while j < n and not text[j].isspace() and text[j] not in '{}"':
+                j += 1
+            yield text[i:j]
+            i = j
+
+
+def vdf_load(text: str) -> dict:
+    root: dict = {}
+    stack, key = [root], None
+    for tok in vdf_tokens(text):
+        if tok == "{":
+            child: dict = {}
+            stack[-1][key] = child
+            stack.append(child)
+            key = None
+        elif tok == "}":
+            stack.pop()
+        elif key is None:
+            key = tok
+        else:
+            stack[-1][key] = tok
+            key = None
+    return root
+
+
+def vdf_get(node: dict, *path: str):
+    for part in path:
+        if not isinstance(node, dict):
+            return None
+        match = next((k for k in node if k.lower() == part.lower()), None)
+        if match is None:
+            return None
+        node = node[match]
+    return node
+
+
+def localconfig_path(user: Path) -> Path:
+    return user / "config" / "localconfig.vdf"
+
+
+def launch_options(user: Path) -> dict[str, str]:
+    path = localconfig_path(user)
+    if not path.is_file():
+        return {}
+    data = vdf_load(path.read_text(encoding="utf-8", errors="replace"))
+    apps = vdf_get(data, "UserLocalConfigStore", "Software", "Valve", "Steam", "apps") or {}
+    return {k: v.get("LaunchOptions", "") for k, v in apps.items() if isinstance(v, dict)}
+
+
+def keel_attached(options: str) -> bool:
+    return "keel-launch" in options or "keel-proton/keel" in options
+
+
+def library_folders() -> list[Path]:
+    roots = [steam_root()]
+    lf = steam_root() / "steamapps" / "libraryfolders.vdf"
+    if lf.is_file():
+        data = vdf_get(vdf_load(lf.read_text(encoding="utf-8", errors="replace")), "libraryfolders") or {}
+        for entry in data.values():
+            if isinstance(entry, dict) and entry.get("path"):
+                roots.append(Path(entry["path"]))
+    seen, out = set(), []
+    for r in roots:
+        s = r / "steamapps"
+        if s.is_dir() and s.resolve() not in seen:
+            seen.add(s.resolve())
+            out.append(s)
+    return out
+
+
+IGNORED_APPS = {"228980"}
+
+
+def installed_games() -> list[dict[str, str]]:
+    games = []
+    for steamapps in library_folders():
+        for manifest in sorted(steamapps.glob("appmanifest_*.acf")):
+            state = vdf_get(vdf_load(manifest.read_text(encoding="utf-8", errors="replace")), "AppState") or {}
+            app = state.get("appid", "")
+            if not app or app in IGNORED_APPS:
+                continue
+            games.append({"appid": app, "name": state.get("name", app),
+                          "dir": str(steamapps / "common" / state.get("installdir", ""))})
+    return games
+
+
+def is_macho(path: Path) -> bool:
+    try:
+        with open(path, "rb") as f:
+            magic = f.read(4)
+    except OSError:
+        return False
+    return magic in (b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe", b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca")
+
+
+def installed_build(directory: Path) -> str:
+    if not directory.is_dir():
+        return "missing"
+    mac = win = False
+    for root, dirs, files in os.walk(directory):
+        depth = Path(root).relative_to(directory).parts
+        if any(d.endswith(".app") for d in dirs):
+            mac = True
+        dirs[:] = [d for d in dirs if not d.endswith(".app")] if len(depth) < 3 else []
+        for f in files:
+            if f.lower().endswith(".exe"):
+                win = True
+            elif not mac and "." not in f and is_macho(Path(root) / f):
+                mac = True
+        if mac and win:
+            break
+    return "both" if mac and win else "mac" if mac else "windows" if win else "unknown"
+
+
+def store_platforms(app: str, offline: bool = False) -> dict | None:
+    """Platforms from the public Steam store API, cached for a week."""
+    cache = Path.home() / "Library" / "Caches" / "Keel" / "appdetails"
+    path = cache / f"{app}.json"
+    try:
+        cached = json.loads(path.read_text())
+        if offline or datetime.now(timezone.utc).timestamp() - path.stat().st_mtime < 7 * 86400:
+            return cached
+    except (OSError, ValueError):
+        cached = None
+    if offline:
+        return None
+    url = f"https://store.steampowered.com/api/appdetails?appids={app}&filters=platforms"
+    try:
+        with urllib.request.urlopen(url, timeout=6) as response:
+            data = json.load(response).get(app, {})
+    except Exception:
+        return cached
+    platforms = data.get("data", {}).get("platforms") if data.get("success") else None
+    if platforms is None:
+        platforms = {}
+    cache.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(platforms))
+    return platforms
+
+
+def game_status(build: str, attached: bool, platforms: dict | None) -> str:
+    has_mac = None if not platforms else bool(platforms.get("mac"))
+    if build in ("mac", "both"):
+        return "Mac native"
+    if build == "windows":
+        if has_mac:
+            return "Mac build available but Windows installed" + (" (Keel attached)" if attached else "")
+        return "Windows via Keel" if attached else "Windows, no Keel launch option (won't run)"
+    return build
+
+
+def platform_switch_on() -> bool:
+    cfg = steam_dev_cfg()
+    if not cfg.is_file():
+        return False
+    return any(line.strip().startswith("@sSteamCmdForcePlatformType") and line.split()[-1:] == ["windows"]
+               for line in cfg.read_text(encoding="utf-8", errors="replace").splitlines())
+
+
+def list_command(argv: list[str]) -> int:
+    offline = "--offline" in argv
+    users = steam_user_dirs()
+    options: dict[str, str] = {}
+    for user in users:
+        for k, v in launch_options(user).items():
+            options[k] = options.get(k) or v
+    rows = []
+    for game in installed_games():
+        build = installed_build(Path(game["dir"]))
+        attached = keel_attached(options.get(game["appid"], ""))
+        platforms = store_platforms(game["appid"], offline)
+        store = "?" if platforms is None else ("mac+win" if platforms.get("mac") and platforms.get("windows")
+                                              else "mac" if platforms.get("mac") else "win" if platforms.get("windows") else "?")
+        rows.append((game["name"], game["appid"], build, store, "yes" if attached else "no",
+                     game_status(build, attached, platforms)))
+    header = ("NAME", "APPID", "INSTALLED", "STORE", "KEEL", "STATUS")
+    widths = [max(len(str(r[i])) for r in rows + [header]) for i in range(5)]
+    for r in [header] + rows:
+        print("  ".join(str(r[i]).ljust(widths[i]) for i in range(5)) + "  " + r[5])
+    print(f"\nWindows depot switch (steam_dev.cfg): {'ON' if platform_switch_on() else 'off'}")
+    if any(r[3] == "?" for r in rows):
+        print("STORE '?' = store lookup unavailable (offline or delisted); run again online.")
+    return 0
+
+
+def keel_appids() -> list[int]:
+    ids: set[int] = set()
+    for user in steam_user_dirs():
+        ids.update(int(k) for k, v in launch_options(user).items() if k.isdigit() and keel_attached(v))
+    return sorted(ids)
+
+
+def timestamp_suffix() -> str:
+    return datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def collection_command(argv: list[str]) -> int:
+    dry = "--dry-run" in argv or "-n" in argv
+    apps = keel_appids()
+    users = steam_user_dirs()
+    if not users:
+        sys.stderr.write("no Steam userdata found\n")
+        return 1
+    if steam_running() and not dry:
+        sys.stderr.write("Steam is running and would overwrite the change. Quit Steam (Steam > Quit), "
+                         "then run: keel collection sync   (or use --dry-run to preview)\n")
+        return 2
+    status = 0
+    for user in users:
+        cs = user / "config" / "cloudstorage"
+        ns = cs / "cloud-storage-namespace-1.json"
+        if not ns.is_file():
+            continue
+        entries = json.loads(ns.read_text(encoding="utf-8"))
+        existing = None
+        for key, entry in entries:
+            if key.startswith("user-collections.") and not entry.get("is_deleted"):
+                try:
+                    value = json.loads(entry.get("value", "{}"))
+                except ValueError:
+                    continue
+                if value.get("name") == "Keel":
+                    existing = (key, entry, value)
+                    break
+        if existing and sorted(existing[2].get("added", [])) == apps and not existing[2].get("removed"):
+            print(f"{user.name}: collection Keel already up to date ({len(apps)} games)")
+            continue
+        cid = existing[2]["id"] if existing else "uc-" + "".join(
+            __import__("secrets").choice("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789") for _ in range(12))
+        key = f"user-collections.{cid}"
+        value = json.dumps({"id": cid, "name": "Keel", "added": apps, "removed": []}, separators=(",", ":"))
+        print(f"{user.name}: {'update' if existing else 'create'} collection Keel ({cid}) = {apps}")
+        if dry:
+            continue
+        stamp = timestamp_suffix()
+        backups = cs.parent / f"cloudstorage.keel-backup-{stamp}"
+        shutil.copytree(cs, backups)
+        try:
+            version = str(json.loads((cs / "cloud-storage-namespaces.json").read_text())[0][1])
+        except Exception:
+            version = existing[1].get("version", "0") if existing else "0"
+        new = {"key": key, "timestamp": int(datetime.now(timezone.utc).timestamp()), "value": value,
+               "version": version}
+        entries = [e for e in entries if e[0] != key] + [[key, new]]
+        tmp = ns.with_suffix(".json.keel-tmp")
+        tmp.write_text(json.dumps(entries, separators=(",", ":")), encoding="utf-8")
+        json.loads(tmp.read_text(encoding="utf-8"))
+        tmp.replace(ns)
+        mod = cs / "cloud-storage-namespace-1.modified.json"
+        try:
+            modified = json.loads(mod.read_text(encoding="utf-8")) if mod.is_file() else []
+        except ValueError:
+            modified = []
+        if key not in modified:
+            modified.append(key)
+        mod.write_text(json.dumps(modified), encoding="utf-8")
+        print(f"  wrote {ns}\n  backup {backups}")
+    return status
+
+
+def platform_command(argv: list[str]) -> int:
+    choice = argv[2].lower() if len(argv) > 2 else "status"
+    cfg = steam_dev_cfg()
+    on = platform_switch_on()
+    if choice == "status":
+        print(f"Windows depot switch: {'ON (new downloads/updates fetch Windows builds)' if on else 'off (Steam picks Mac builds when available)'}")
+        print(f"  {cfg}")
+        return 0
+    if choice not in ("windows", "mac"):
+        sys.stderr.write("usage: keel platform windows|mac|status\n")
+        return 1
+    want = choice == "windows"
+    if want == on:
+        print(f"already {'ON' if on else 'off'}")
+        return 0
+    lines = cfg.read_text(encoding="utf-8").splitlines() if cfg.is_file() else []
+    if cfg.is_file():
+        shutil.copy2(cfg, cfg.with_name(cfg.name + ".keel-backup-" + timestamp_suffix()))
+    lines = [l for l in lines if "sSteamCmdForcePlatformType" not in l]
+    if want:
+        lines.append("@sSteamCmdForcePlatformType windows")
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    print(f"Windows depot switch now {'ON' if want else 'off'}.")
+    print("Restart Steam for it to take effect." if steam_running() else "Takes effect next time Steam starts.")
+    if want:
+        print("Turn it off again (keel platform mac) once the Windows-only game finishes installing.")
+    return 0
+
+
+def attach_command(argv: list[str]) -> int:
+    if len(argv) < 3 or not argv[2].isdigit():
+        sys.stderr.write(f"usage: keel {argv[1]} <appid>\n")
+        return 1
+    if steam_running():
+        sys.stderr.write("Quit Steam first; it rewrites localconfig.vdf on exit.\n")
+        return 2
+    app, attach = argv[2], argv[1] == "attach"
+    launcher = tool_dir() / "keel-launch"
+    wanted = f'"{launcher}" waitforexitandrun %command%'
+    escaped = wanted.replace("\\", "\\\\").replace('"', '\\"')
+    for user in steam_user_dirs():
+        path = localconfig_path(user)
+        if not path.is_file():
+            continue
+        lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+        depth, in_apps, app_depth, start, end = 0, False, -1, -1, -1
+        path_stack: list[str] = []
+        last = None
+        for i, line in enumerate(lines):
+            s = line.strip()
+            if s == "{":
+                path_stack.append(last or "")
+                if [p.lower() for p in path_stack[-6:]] == ["userlocalconfigstore", "software", "valve", "steam", "apps", app]:
+                    start = i
+            elif s == "}":
+                if start >= 0 and end < 0 and len(path_stack) and path_stack[-1] == app and \
+                        [p.lower() for p in path_stack[-6:-1]] == ["userlocalconfigstore", "software", "valve", "steam", "apps"]:
+                    end = i
+                path_stack.pop()
+            elif s.startswith('"'):
+                last = s.split('"')[1]
+        if start < 0:
+            print(f"{user.name}: app {app} not in localconfig.vdf (launch it once or open its Properties)")
+            continue
+        indent = lines[start][: len(lines[start]) - len(lines[start].lstrip())] + "\t"
+        body = [l for l in lines[start + 1:end] if not (l.strip().startswith('"LaunchOptions"') and l.count('"') >= 4
+                                                    and lines.index(l, start) and l.startswith(indent + '"'))]
+        if attach:
+            body.insert(0, f'{indent}"LaunchOptions"\t\t"{escaped}"\n')
+        shutil.copy2(path, path.with_name(path.name + ".keel-backup-" + timestamp_suffix()))
+        path.write_text("".join(lines[: start + 1] + body + lines[end:]), encoding="utf-8")
+        print(f"{user.name}: {'attached' if attach else 'detached'} {app}")
+    return 0
+
+
 def destroy_prefix() -> int:
     target = refuse_dangerous(data_path())
     if not (target / "pfx").exists() and not (target / "version").exists():
@@ -1149,6 +1538,14 @@ def main(argv: list[str]) -> int:
         return setup_bridge(argv)
     if verb == "graphics":
         return graphics_command(argv)
+    if verb == "list":
+        return list_command(argv)
+    if verb == "collection":
+        return collection_command(argv)
+    if verb == "platform":
+        return platform_command(argv)
+    if verb in ("attach", "detach"):
+        return attach_command(argv)
     if verb == "fetch-crossover-src":
         return fetch_crossover_src(argv)
     if verb == "fetch-dxmt":

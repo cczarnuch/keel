@@ -63,7 +63,7 @@ Quit Steam completely (Steam menu, Quit), then open it again.
 
 A launch option is already on your clipboard. After a game is installed, open Properties and paste it into Launch Options.
 
-Windows-only games stay hidden until Steam will download a Windows copy. Keel can turn that on. While it is on, Steam may prefer the Windows build even for games that have a Mac version. Delete the line from steam_dev.cfg to undo it." buttons {"Not now", "Enable Windows depots"} default button "Enable Windows depots" with title "Keel")
+Windows-only games stay hidden until Steam will download a Windows copy. Keel can turn that on. While it is on, Steam may prefer the Windows build even for games that have a Mac version. Recommended: leave it off, turn it on only while installing a Windows-only game, then turn it off (keel platform windows / keel platform mac)." buttons {"Not now", "Enable Windows depots"} default button "Not now" with title "Keel")
 return theButton
 APPLESCRIPT
 )"

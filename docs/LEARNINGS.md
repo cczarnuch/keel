@@ -55,3 +55,9 @@ through Keel's bridge mode on an Apple Silicon Mac. All numbers were measured on
 ## Keel bugs fixed along the way
 - DXMT staging picked the **32-bit (i386-windows)** DLLs for 64-bit games; it now prefers x86_64-windows.
 - `KEEL_WINE` now forces the runner for every runner setting, and `doctor` reports it along with bridge readiness and per-app graphics.
+
+## Steam library files (keel list / collection / platform)
+
+- Collections live in `userdata/<id>/config/cloudstorage/cloud-storage-namespace-1.json`: a JSON list of `[key, {key, timestamp, value, version, is_deleted?}]`. Collections are `user-collections.<id>` with `value` a JSON string `{"id","name","added":[appids],"removed":[]}` (dynamic ones add `filterSpec`). `cloud-storage-namespace-1.modified.json` is a list of keys with unsynced local edits; `cloud-storage-namespaces.json` holds `[[namespace, version]]`. Steam rewrites these on exit, so edit only while Steam is quit.
+- `steam_dev.cfg`'s `@sSteamCmdForcePlatformType windows` applies to every download, so it is best toggled per install. Steam reads it at startup.
+- Store platforms: `https://store.steampowered.com/api/appdetails?appids=<id>&filters=platforms`.
