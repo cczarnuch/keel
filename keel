@@ -37,7 +37,7 @@ Keel {version} — Steam Play for macOS
   keel doctor                              print what this Mac can run
   keel graphics <appid> [backend]          show or set KEEL_GRAPHICS for one game
   keel list [--offline]                    installed games: build, store platforms, Keel status
-  keel collection [sync] [--dry-run]       put Keel-attached games in a "Keel" Steam collection (quit Steam)
+  keel collection [sync] [--dry-run|--json] "Keel" Steam collection (via Steam DevTools, else file edit)
   keel platform windows|mac|status         toggle Steam's Windows-depot switch (restart Steam)
   keel attach|detach <appid>               set/remove Keel launch option (quit Steam)
   keel setup-bridge [--yes]                check/install bridge-mode dependencies
@@ -1372,6 +1372,132 @@ def timestamp_suffix() -> str:
     return datetime.now().strftime("%Y%m%d-%H%M%S")
 
 
+# ---- Steam CEF DevTools (needs Steam started with -cef-enable-debugging) ----
+
+CEF_PORT = int(os.environ.get("KEEL_CEF_PORT", "8080"))
+
+
+def cef_shared_context_ws() -> str | None:
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{CEF_PORT}/json", timeout=3) as response:
+            targets = json.load(response)
+    except Exception:
+        return None
+    for target in targets:
+        if target.get("title") == "SharedJSContext" and target.get("webSocketDebuggerUrl"):
+            return target["webSocketDebuggerUrl"]
+    return None
+
+
+def cef_eval(ws_url: str, expression: str, timeout: float = 15.0):
+    """Evaluate JS in a CEF target over a minimal stdlib WebSocket client."""
+    import base64
+    import socket
+    import struct
+    from urllib.parse import urlparse
+
+    url = urlparse(ws_url)
+    sock = socket.create_connection((url.hostname, url.port or 80), timeout=timeout)
+    try:
+        key = base64.b64encode(os.urandom(16)).decode()
+        sock.sendall((f"GET {url.path} HTTP/1.1\r\nHost: {url.hostname}:{url.port}\r\nUpgrade: websocket\r\n"
+                      f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
+        head = b""
+        while b"\r\n\r\n" not in head:
+            chunk = sock.recv(4096)
+            if not chunk:
+                raise OSError("websocket handshake failed")
+            head += chunk
+        if b" 101 " not in head.split(b"\r\n", 1)[0]:
+            raise OSError("websocket handshake refused")
+        buffer = head.split(b"\r\n\r\n", 1)[1]
+
+        def recv_exact(count: int) -> bytes:
+            nonlocal buffer
+            while len(buffer) < count:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    raise OSError("websocket closed")
+                buffer += chunk
+            data, buffer = buffer[:count], buffer[count:]
+            return data
+
+        payload = json.dumps({"id": 1, "method": "Runtime.evaluate", "params": {
+            "expression": expression, "awaitPromise": True, "returnByValue": True}}).encode()
+        mask = os.urandom(4)
+        length = len(payload)
+        header = bytes([0x81]) + (bytes([0x80 | length]) if length < 126 else
+                                  bytes([0x80 | 126]) + struct.pack(">H", length) if length < 65536 else
+                                  bytes([0x80 | 127]) + struct.pack(">Q", length))
+        sock.sendall(header + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+        message = b""
+        while True:
+            b0, b1 = recv_exact(2)
+            size = b1 & 0x7F
+            if size == 126:
+                size = struct.unpack(">H", recv_exact(2))[0]
+            elif size == 127:
+                size = struct.unpack(">Q", recv_exact(8))[0]
+            data = recv_exact(size)
+            opcode = b0 & 0x0F
+            if opcode == 8:
+                raise OSError("websocket closed")
+            if opcode in (0, 1, 2):
+                message += data
+                if b0 & 0x80:
+                    reply = json.loads(message)
+                    message = b""
+                    if reply.get("id") == 1:
+                        result = reply.get("result", {})
+                        if "exceptionDetails" in result:
+                            raise RuntimeError(json.dumps(result["exceptionDetails"])[:500])
+                        return result.get("result", {}).get("value")
+    finally:
+        sock.close()
+
+
+KEEL_COLLECTION_JS = r"""
+(async () => {
+  const want = %s, preferred = %s;
+  const all = collectionStore.userCollections.filter(c => c.displayName === 'Keel');
+  let keep = all.find(c => c.id === preferred) || all[0];
+  let removed = 0;
+  for (const c of all) if (c !== keep) { await c.Delete(); removed++; }
+  if (!keep) keep = collectionStore.NewUnsavedCollection('Keel', undefined, []);
+  const ov = ids => ids.map(id => appStore.GetAppOverviewByAppID(id)).filter(Boolean);
+  const have = keep.allApps.map(a => a.appid);
+  const add = want.filter(id => !have.includes(id)), drop = have.filter(id => !want.includes(id));
+  if (add.length) keep.AddApps(ov(add));
+  if (drop.length) keep.RemoveApps(ov(drop));
+  await keep.Save();
+  const c = collectionStore.GetCollection(keep.id);
+  return {id: keep.id, apps: c ? c.allApps.map(a => a.appid).sort((x, y) => x - y) : null,
+          added: add, dropped: drop, removedDuplicates: removed};
+})()
+"""
+
+
+def collection_via_cef(apps: list[int], preferred_id: str = "") -> dict | None:
+    ws = cef_shared_context_ws()
+    if not ws:
+        return None
+    js = KEEL_COLLECTION_JS % (json.dumps(apps), json.dumps(preferred_id))
+    return cef_eval(ws, js)
+
+
+def existing_keel_id(users: list[Path]) -> str:
+    for user in users:
+        ns = user / "config" / "cloudstorage" / "cloud-storage-namespace-1.json"
+        try:
+            for key, entry in json.loads(ns.read_text(encoding="utf-8")):
+                if key.startswith("user-collections.") and not entry.get("is_deleted") and \
+                        json.loads(entry.get("value", "{}")).get("name") == "Keel":
+                    return key.split(".", 1)[1]
+        except (OSError, ValueError):
+            pass
+    return ""
+
+
 def collection_command(argv: list[str]) -> int:
     dry = "--dry-run" in argv or "-n" in argv
     apps = keel_appids()
@@ -1379,9 +1505,23 @@ def collection_command(argv: list[str]) -> int:
     if not users:
         sys.stderr.write("no Steam userdata found\n")
         return 1
+    if not dry and "--json" not in argv and cef_shared_context_ws():
+        # Primary path: ask Steam's own library code to save the collection. It updates the
+        # in-memory store, the CEF localStorage cache and the cloud, so it shows up immediately.
+        try:
+            result = collection_via_cef(apps, existing_keel_id(users))
+        except Exception as error:
+            result = None
+            sys.stderr.write(f"Steam DevTools path failed ({error}); falling back\n")
+        if result:
+            print(f"Steam: collection Keel ({result['id']}) = {result['apps']}"
+                  f"  added {result['added']} removed {result['dropped']} duplicates deleted {result['removedDuplicates']}")
+            return 0 if result["apps"] == apps else 1
     if steam_running() and not dry:
-        sys.stderr.write("Steam is running and would overwrite the change. Quit Steam (Steam > Quit), "
-                         "then run: keel collection sync   (or use --dry-run to preview)\n")
+        sys.stderr.write("Steam is running without -cef-enable-debugging, so Keel cannot talk to it and a file edit "
+                         "would be overwritten. Either quit Steam and run `keel collection sync`, or restart it with\n"
+                         "  open -a Steam --args -cef-enable-debugging\nand run `keel collection sync` again "
+                         "(recommended: Steam then saves the collection itself).\n")
         return 2
     status = 0
     for user in users:
@@ -1419,6 +1559,17 @@ def collection_command(argv: list[str]) -> int:
             version = existing[1].get("version", "0") if existing else "0"
         new = {"key": key, "timestamp": int(datetime.now(timezone.utc).timestamp()), "value": value,
                "version": version}
+        now = new["timestamp"]
+        for k, e in entries:
+            if k != key and k.startswith("user-collections.") and not e.get("is_deleted"):
+                try:
+                    dup = json.loads(e.get("value", "{}")).get("name") == "Keel"
+                except ValueError:
+                    dup = False
+                if dup:
+                    e.pop("value", None)
+                    e.update(is_deleted=True, timestamp=now)
+                    print(f"  deleting duplicate {k}")
         entries = [e for e in entries if e[0] != key] + [[key, new]]
         tmp = ns.with_suffix(".json.keel-tmp")
         tmp.write_text(json.dumps(entries, separators=(",", ":")), encoding="utf-8")
