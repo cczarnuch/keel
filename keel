@@ -22,7 +22,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.9.0"
+VERSION = "0.15.0"
 USAGE = """\
 Keel {version} — Steam Play for macOS
 
@@ -35,6 +35,18 @@ Keel {version} — Steam Play for macOS
   keel setup-steam                         install the Windows Steam client
   keel fetch-dxmt                          download DXMT into Application Support
   keel doctor                              print what this Mac can run
+  keel graphics <appid> [backend]          show or set KEEL_GRAPHICS for one game
+  keel list [--offline]                    installed games: build, store platforms, Keel status
+  keel collection [sync] [--dry-run|--json] "Keel" Steam collection (via Steam DevTools, else file edit)
+  keel platform windows|mac|status         toggle Steam's Windows-depot switch (restart Steam)
+  keel attach|detach <appid>               set/remove Keel launch option (quit Steam)
+  keel setup-bridge [--yes]                check/install bridge-mode dependencies
+  keel fetch-crossover-src [version]       download, unpack and patch CodeWeavers' sources
+
+  KEEL_STEAMWORKS=bridge  Proton-style lsteamclient bridge to Mac Steam (needs KEEL_WINE)
+  KEEL_GRAPHICS=d3dmetal|dxmt|dxvk|wined3d|auto; KEEL_WINE_D3DMETAL / KEEL_WINE_DXMT
+                          pick a runner variant per backend; KEEL_DRY_RUN=1 logs and exits
+  KEEL_CX_SRC             CrossOver sources dir (default ~/Downloads/sources; wine tree in wine/)
   keel version
 """.format(version=VERSION)
 
@@ -197,11 +209,19 @@ def family_candidates(runner: str) -> list[Path]:
     return groups.get(runner, groups["auto"])
 
 
+def forced_runner() -> Path | None:
+    forced = os.environ.get("KEEL_WINE", "")
+    if forced:
+        path = Path(forced).expanduser()
+        if executable(path):
+            return path
+    return None
+
+
 def find_runner(runner: str) -> Path | None:
-    if runner == "auto":
-        forced = os.environ.get("KEEL_WINE", "")
-        if forced and executable(Path(forced)):
-            return Path(forced)
+    forced = forced_runner()
+    if forced is not None:
+        return forced
     for candidate in family_candidates(runner):
         if executable(candidate):
             return candidate
@@ -219,10 +239,14 @@ def dxmt_dll_dir() -> Path | None:
     candidates.append(support_dir() / "dxmt" / "x64")
     candidates.append(tool_dir() / "dxmt" / "x64")
     for directory in candidates:
+        # 64-bit games need the x86_64 DLLs; never hand them i386-windows.
+        if directory.name == "i386-windows" and (directory.parent / "x86_64-windows" / "d3d11.dll").is_file():
+            return directory.parent / "x86_64-windows"
+        for sub in ("x86_64-windows", "x64"):
+            if (directory / sub / "d3d11.dll").is_file():
+                return directory / sub
         if (directory / "d3d11.dll").is_file():
             return directory
-        if (directory / "x64" / "d3d11.dll").is_file():
-            return directory / "x64"
     return None
 
 
@@ -265,6 +289,9 @@ def ensure_prefix(wine: Path, prefix: Path, winver: str) -> None:
     if not system.is_file():
         log(f"creating prefix {prefix}")
         subprocess.run([str(wine), "wineboot", "--init"], env=env, check=False)
+    if prefix_incomplete(prefix):
+        log("prefix looks incomplete (no services registered); running wineboot -u")
+        subprocess.run([str(wine), "wineboot", "-u"], env=env, check=False)
     version_file = prefix.parent / "version"
     stamp = f"keel-{VERSION}-win{winver}"
     if version_file.is_file() and version_file.read_text(encoding="utf-8").strip() == stamp:
@@ -276,6 +303,80 @@ def ensure_prefix(wine: Path, prefix: Path, winver: str) -> None:
         check=False,
     )
     version_file.write_text(stamp + "\n", encoding="utf-8")
+
+
+MAC_DRIVER_KEY = r"HKCU\Software\Wine\Mac Driver"
+
+
+def apply_retina(wine: Path, prefix: Path, enabled: bool) -> None:
+    """Set winemac RetinaMode so games see native pixels, not scaled points. Idempotent."""
+    want = "y" if enabled else "n"
+    user_reg = prefix / "user.reg"
+    try:
+        text = user_reg.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        text = ""
+    section = "[Software\\\\Wine\\\\Mac Driver]"
+    if section in text:
+        block = text.split(section, 1)[1].split("\n[", 1)[0]
+        if f'"RetinaMode"="{want}"' in block:
+            return
+    log(f"setting Mac Driver RetinaMode={want}")
+    subprocess.run(
+        [str(wine), "reg", "add", MAC_DRIVER_KEY, "/v", "RetinaMode", "/d", want, "/f"],
+        env=wine_env(wine, prefix),
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def prefix_incomplete(prefix: Path) -> bool:
+    """A wineboot that was killed part-way leaves no service keys (RpcSs, nsiproxy...)."""
+    try:
+        text = (prefix / "system.reg").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return "\\\\Services\\\\RpcSs]" not in text
+
+
+def reg_value_is(prefix: Path, hive: str, section: str, entry: str) -> bool:
+    try:
+        text = (prefix / hive).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    marker = "[" + section.replace("\\", "\\\\") + "]"
+    if marker not in text:
+        return False
+    block = text.split(marker, 1)[1].split("\n[", 1)[0]
+    return entry in block
+
+
+def apply_dpi(wine: Path, prefix: Path, dpi: str) -> None:
+    """Set Wine's LogPixels (96 = 100%). Idempotent; empty leaves the prefix alone."""
+    if not dpi.isdigit() or not 48 <= int(dpi) <= 480:
+        if dpi:
+            log(f"ignoring KEEL_DPI={dpi!r} (want 48-480)")
+        return
+    entry = f'"LogPixels"=dword:{int(dpi):08x}'
+    targets = [
+        ("user.reg", "Control Panel\\Desktop", r"HKCU\Control Panel\Desktop"),
+        ("system.reg", "System\\CurrentControlSet\\Hardware Profiles\\Current\\Software\\Fonts",
+         r"HKLM\System\CurrentControlSet\Hardware Profiles\Current\Software\Fonts"),
+    ]
+    env = wine_env(wine, prefix)
+    for hive, section, key in targets:
+        if hive == "system.reg":
+            # CurrentControlSet is a link; Wine stores it under ControlSet001
+            if reg_value_is(prefix, hive, section.replace("CurrentControlSet", "ControlSet001"), entry):
+                continue
+        elif reg_value_is(prefix, hive, section, entry):
+            continue
+        log(f"setting LogPixels={dpi} in {key}")
+        subprocess.run(
+            [str(wine), "reg", "add", key, "/v", "LogPixels", "/t", "REG_DWORD", "/d", dpi, "/f"],
+            env=env, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
 
 
 def stage_native_dlls(prefix: Path, directory: Path) -> None:
@@ -291,6 +392,331 @@ def stage_native_dlls(prefix: Path, directory: Path) -> None:
         log(f"staged {dll.name}")
 
 
+BRIDGE_STEAM_DIR = r"C:\Program Files (x86)\Steam"
+
+
+def helpers_dir() -> Path:
+    return tool_dir() / "helpers"
+
+
+def runner_root(wine: Path) -> Path:
+    """<prefix>/bin/wine -> <prefix>; follows the lib/wine/x86_64-unix/wine symlink layout too."""
+    root = wine.parent.parent
+    if (root / "lib" / "wine").is_dir():
+        return root
+    resolved = wine.resolve()
+    for parent in resolved.parents:
+        if (parent / "lib" / "wine").is_dir():
+            return parent
+    return root
+
+
+def graphics_runner(graphics: str) -> tuple[Path | None, str]:
+    """Runner variant for the graphics backend (KEEL_WINE_DXMT / KEEL_WINE_D3DMETAL), if set."""
+    key = {"dxmt": "KEEL_WINE_DXMT", "d3dmetal": "KEEL_WINE_D3DMETAL"}.get(graphics)
+    if not key:
+        return None, ""
+    raw = os.environ.get(key, "")
+    if not raw:
+        return None, ""
+    path = Path(raw).expanduser()
+    if executable(path):
+        return path, key
+    log(f"{key}={raw} is not executable; ignoring")
+    return None, ""
+
+
+def runner_has_dxmt(wine: Path) -> bool:
+    lib = runner_root(wine) / "lib" / "wine"
+    return (lib / "x86_64-windows" / "winemetal.dll").is_file() and \
+        (lib / "x86_64-unix" / "winemetal.so").is_file()
+
+
+def ensure_winemetal(prefix: Path, wine: Path) -> None:
+    """DXMT's d3d11/dxgi import winemetal.dll; Wine needs a system32 placeholder to load it."""
+    source = runner_root(wine) / "lib" / "wine" / "x86_64-windows" / "winemetal.dll"
+    target = prefix / "drive_c" / "windows" / "system32" / "winemetal.dll"
+    if target.is_file() and target.stat().st_size == source.stat().st_size:
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, target)
+    log("staged system32/winemetal.dll")
+
+
+def bridge_files(wine: Path) -> tuple[Path, Path]:
+    lib = runner_root(wine) / "lib" / "wine"
+    return lib / "x86_64-windows" / "lsteamclient.dll", lib / "x86_64-unix" / "lsteamclient.so"
+
+
+def bridge_problems(wine: Path | None) -> list[str]:
+    problems: list[str] = []
+    if wine is None:
+        return ["no Wine runner (set KEEL_WINE to a Wine 11 build with lsteamclient)"]
+    dll, so = bridge_files(wine)
+    if not dll.is_file():
+        problems.append(f"missing {dll}")
+    if not so.is_file():
+        problems.append(f"missing {so}")
+    if not (helpers_dir() / "keel_steam.exe").is_file():
+        problems.append(f"missing {helpers_dir() / 'keel_steam.exe'}")
+    if not mac_steamclient().is_file():
+        problems.append(f"missing {mac_steamclient()}")
+    return problems
+
+
+DEFAULT_RUNNER = Path.home() / "opt" / "wine-cx11-x86" / "bin" / "wine"
+DEFAULT_DXMT_RUNNER = Path.home() / "opt" / "wine-cx11-x86-dxmt" / "bin" / "wine"
+RUNNERS_DOC = "docs/RUNNERS.md (github.com/cczarnuch/keel)"
+
+
+def rosetta_installed() -> bool:
+    try:
+        return subprocess.run(["/usr/bin/arch", "-x86_64", "/usr/bin/true"],
+                              capture_output=True, timeout=20).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def clt_installed() -> bool:
+    try:
+        ok = subprocess.run(["/usr/bin/xcode-select", "-p"], capture_output=True, timeout=20).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return ok and Path("/usr/bin/clang").exists()
+
+
+def bridge_checklist() -> list[tuple[bool, str, str]]:
+    """(ok, item, how to fix) for everything bridge mode needs. Nothing here installs anything."""
+    items: list[tuple[bool, str, str]] = []
+    items.append((rosetta_installed(), "Rosetta 2",
+                  "keel setup-bridge (or: softwareupdate --install-rosetta --agree-to-license)"))
+    items.append((clt_installed(), "Xcode Command Line Tools (clang, python3)", "xcode-select --install"))
+    items.append((mac_steamclient().is_file(), f"Mac Steam steamclient.dylib ({mac_steamclient()})",
+                  "install Steam for Mac and sign in once"))
+    items.append(((helpers_dir() / "keel_steam.exe").is_file(), "keel_steam.exe helper",
+                  "re-run Install Keel.command"))
+    raw = os.environ.get("KEEL_WINE", "")
+    wine = Path(raw).expanduser() if raw else DEFAULT_RUNNER
+    where = "KEEL_WINE" if raw else "default path"
+    items.append((executable(wine), f"x86_64 Wine 11 runner ({where}: {wine})",
+                  f"build it from source: {RUNNERS_DOC} section 1"))
+    if executable(wine):
+        dll, so = bridge_files(wine)
+        items.append((dll.is_file() and so.is_file(), "lsteamclient.dll + lsteamclient.so in the runner",
+                       f"build with wine-patches/0003 + build/build-lsc-unix.sh ({RUNNERS_DOC})"))
+        fw = runner_root(wine) / "lib" / "external" / "D3DMetal.framework"
+        items.append((fw.is_dir(), "D3DMetal (GPTK) in the runner",
+                       f"copy from Apple's Game Porting Toolkit: {RUNNERS_DOC} section 2"))
+    missing_libs = [name for name in ("libfreetype.6.dylib", "libgnutls.30.dylib")
+                    if not any((Path(d) / name).is_file() for d in dyld_paths())]
+    items.append((not missing_libs, "x86_64 runtime dylibs (" + ":".join(dyld_paths()) + ")",
+                  "missing " + ", ".join(missing_libs) + f"; set KEEL_DYLD_PATH or see {RUNNERS_DOC} section 0"
+                  if missing_libs else ""))
+    raw_dxmt = os.environ.get("KEEL_WINE_DXMT", "")
+    dxmt = Path(raw_dxmt).expanduser() if raw_dxmt else DEFAULT_DXMT_RUNNER
+    items.append((executable(dxmt) and runner_has_dxmt(dxmt), f"DXMT runner clone (optional; {dxmt})",
+                  f"cp -cR the runner and add DXMT builtins: {RUNNERS_DOC} section 3; keel fetch-dxmt downloads DXMT"))
+    items.append((True, "Wine patches (fiber/QoS, wininet cache)",
+                  "not detectable from binaries; make sure the runner was built with wine-patches/0004-0006"))
+    return items
+
+
+def checklist_lines(items: list[tuple[bool, str, str]]) -> list[str]:
+    lines = []
+    for ok, item, fix in items:
+        mark = "?" if item.startswith("Wine patches") else ("ok" if ok else "MISSING")
+        lines.append(f"  [{mark}] {item}")
+        if mark == "?":
+            lines.append(f"            -> {fix}")
+        if not ok and fix:
+            lines.append(f"            -> {fix}")
+    return lines
+
+
+def setup_bridge(argv: list[str]) -> int:
+    """Check bridge-mode dependencies and install the parts macOS can install for us."""
+    assume_yes = "--yes" in argv
+    if not rosetta_installed():
+        answer = "y" if assume_yes else (input("Rosetta 2 is not installed. Install it now? [y/N] ")
+                                         if sys.stdin.isatty() else "n")
+        if answer.strip().lower().startswith("y"):
+            subprocess.run(["/usr/sbin/softwareupdate", "--install-rosetta", "--agree-to-license"], check=False)
+    if not clt_installed():
+        print("Xcode Command Line Tools are missing; opening the macOS installer dialog.")
+        subprocess.run(["/usr/bin/xcode-select", "--install"], check=False)
+    present, _, missing = cx_src_status()
+    if not present or missing:
+        what = "missing" if not present else "not fully patched"
+        dry = os.environ.get("KEEL_DRY_RUN", "") == "1"
+        if dry:
+            print(f"CrossOver sources {what} at {cx_src_dir()}; would offer: keel fetch-crossover-src")
+        else:
+            answer = "y" if assume_yes else (input(f"CrossOver sources {what} at {cx_src_dir()}."
+                                                   " Run keel fetch-crossover-src now? [y/N] ")
+                                             if sys.stdin.isatty() else "n")
+            if answer.strip().lower().startswith("y"):
+                fetch_crossover_src(["keel", "fetch-crossover-src"])
+    items = bridge_checklist()
+    print("Steamworks bridge requirements:")
+    print("\n".join(checklist_lines(items)))
+    required = [item for item in items if not item[1].startswith("DXMT runner")]
+    ready = all(ok for ok, _, _ in required)
+    print("Bridge mode: " + ("ready" if ready else "NOT ready (the Wine runner must be built by hand; see " + RUNNERS_DOC + ")"))
+    return 0 if ready else 1
+
+
+# CodeWeavers' source drops: https://www.codeweavers.com/crossover/source links
+# media.codeweavers.com/pub/crossover/source/crossover-sources-<version>.tar.gz.
+# CrossOver 26.x is the Wine 11 based release the wine-patches target. CodeWeavers
+# publishes no checksum file, so integrity is checked with `tar -tzf` and the sha256 printed.
+CX_SRC_VERSION = "26.3.0"
+CX_SRC_URL = "https://media.codeweavers.com/pub/crossover/source/crossover-sources-{version}.tar.gz"
+
+
+def cache_dir() -> Path:
+    raw = os.environ.get("KEEL_CACHE_DIR", "")
+    return Path(raw).expanduser() if raw else Path.home() / "Library" / "Caches" / "Keel"
+
+
+def cx_src_dir() -> Path:
+    raw = os.environ.get("KEEL_CX_SRC", "")
+    return Path(raw).expanduser() if raw else Path.home() / "Downloads" / "sources"
+
+
+def proton_src_dir() -> Path:
+    raw = os.environ.get("KEEL_PROTON_SRC", "") or os.environ.get("PROTON_SRC", "")
+    return Path(raw).expanduser() if raw else Path.home() / "src" / "proton"
+
+
+def wine_patches() -> list[Path]:
+    return sorted((tool_dir() / "wine-patches").glob("000[1-6]-*.patch"))
+
+
+def patch_state(wine: Path, patch: Path) -> str:
+    """'applied', 'clean' (applies), or 'conflict'."""
+    def ok(*extra: str) -> bool:
+        return subprocess.run(["patch", "-p1", "-f", "-s", "--dry-run", *extra, "-i", str(patch)],
+                              cwd=wine, capture_output=True).returncode == 0
+    if ok("-R"):
+        return "applied"
+    return "clean" if ok() else "conflict"
+
+
+def cx_src_status() -> tuple[bool, list[str], list[str]]:
+    """(wine tree present, applied patch names, not-applied patch names)."""
+    wine = cx_src_dir() / "wine"
+    if not (wine / "configure.ac").is_file():
+        return False, [], []
+    applied, missing = [], []
+    for patch in wine_patches():
+        (applied if patch_state(wine, patch) == "applied" else missing).append(patch.name)
+    return True, applied, missing
+
+
+def apply_wine_patches(wine: Path) -> int:
+    failures = 0
+    for patch in wine_patches():
+        if patch.name.startswith("0003") and not (wine / "dlls" / "lsteamclient" / "unixlib.cpp").is_file():
+            proton = proton_src_dir() / "lsteamclient"
+            if not proton.is_dir():
+                log(f"skip {patch.name}: needs Proton's lsteamclient/ (proton_11.0 @ bc89621) at {proton};"
+                    " set KEEL_PROTON_SRC and re-run")
+                failures += 1
+                continue
+            log(f"copying {proton} -> {wine / 'dlls' / 'lsteamclient'}")
+            shutil.copytree(proton, wine / "dlls" / "lsteamclient", dirs_exist_ok=True)
+        state = patch_state(wine, patch)
+        if state == "applied":
+            log(f"already applied: {patch.name}")
+        elif state == "clean":
+            subprocess.run(["patch", "-p1", "-f", "-s", "-i", str(patch)], cwd=wine, check=True)
+            log(f"applied: {patch.name}")
+        else:
+            log(f"DOES NOT APPLY: {patch.name}")
+            failures += 1
+    return failures
+
+
+def fetch_crossover_src(argv: list[str]) -> int:
+    version = argv[2] if len(argv) > 2 else CX_SRC_VERSION
+    url = CX_SRC_URL.format(version=version)
+    archive = cache_dir() / f"crossover-sources-{version}.tar.gz"
+    dest = cx_src_dir()
+    wine = dest / "wine"
+    if os.environ.get("KEEL_DRY_RUN", "") == "1":
+        log(f"dry run: download {url} -> {archive} (curl -C -, resumable)")
+        log(f"dry run: verify with tar -tzf, print sha256; unpack to {dest}")
+        log(f"dry run: patch {wine} with " + ", ".join(p.name for p in wine_patches())
+            + f" (0003 copies lsteamclient/ from {proton_src_dir()})")
+        return 0
+    if not (wine / "configure.ac").is_file():
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        log(f"downloading {url}")
+        if subprocess.run(["curl", "-fL", "-C", "-", "--retry", "3", "-o", str(archive), url]).returncode != 0:
+            log(f"download failed; re-run to resume, or delete {archive}")
+            return 1
+        if subprocess.run(["tar", "-tzf", str(archive)], stdout=subprocess.DEVNULL).returncode != 0:
+            log(f"{archive} is corrupt; delete it and retry")
+            return 1
+        import hashlib
+        digest = hashlib.sha256()
+        with open(archive, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(chunk)
+        log(f"sha256 {digest.hexdigest()}  {archive.name} (CodeWeavers publishes no checksum)")
+        staging = cache_dir() / f"unpack-{version}"
+        if staging.exists():
+            shutil.rmtree(staging)
+        staging.mkdir(parents=True)
+        log(f"unpacking to {dest}")
+        with tarfile.open(archive, "r:gz") as tar:
+            safe_extract(tar, staging)
+        top = staging / "sources"
+        if not (top / "wine" / "configure.ac").is_file():
+            log("archive has no sources/wine tree")
+            return 1
+        dest.mkdir(parents=True, exist_ok=True)
+        for child in top.iterdir():
+            if not (dest / child.name).exists():
+                shutil.move(str(child), str(dest / child.name))
+        shutil.rmtree(staging)
+    else:
+        log(f"sources present at {dest}")
+    failures = apply_wine_patches(wine)
+    log(f"wine tree: {wine} ({'patched' if not failures else f'{failures} patch(es) not applied'})")
+    return 1 if failures else 0
+
+
+def mac_steamclient() -> Path:
+    forced = os.environ.get("KEEL_STEAMCLIENT_DYLIB", "")
+    if forced:
+        return Path(forced).expanduser()
+    return (Path.home() / "Library" / "Application Support" / "Steam" / "Steam.AppBundle"
+            / "Steam" / "Contents" / "MacOS" / "steamclient.dylib")
+
+
+def dyld_paths() -> list[str]:
+    raw = os.environ.get("KEEL_DYLD_PATH", "")
+    paths = [p for p in raw.split(":") if p] if raw else [str(Path.home() / "opt" / "cxdeps-x86" / "lib")]
+    return [str(Path(p).expanduser()) for p in paths]
+
+
+def copy_if_changed(source: Path, target: Path) -> None:
+    if target.is_file() and target.stat().st_size == source.stat().st_size \
+            and target.stat().st_mtime >= source.stat().st_mtime:
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, target)
+    log(f"staged {target.name}")
+
+
+def stage_bridge(prefix: Path, wine: Path) -> None:
+    steam_dir = prefix / "drive_c" / "Program Files (x86)" / "Steam"
+    dll, _ = bridge_files(wine)
+    copy_if_changed(dll, steam_dir / "steamclient64.dll")
+    copy_if_changed(helpers_dir() / "keel_steam.exe", steam_dir / "keel_steam.exe")
+
+
 def resolve_graphics(requested: str) -> str:
     if requested != "auto":
         return requested
@@ -300,8 +726,9 @@ def resolve_graphics(requested: str) -> str:
 def dll_overrides(graphics: str, extra: str) -> str:
     table = {
         "dxmt": "d3d11,dxgi,d3d10core=n,b",
+        "dxmt-runner": "d3d11,dxgi,d3d10core,winemetal=b",
         "dxvk": "d3d11,dxgi,d3d10core,d3d9=n,b",
-        "d3dmetal": "d3d11,dxgi,d3d12=b",
+        "d3dmetal": "d3d11,dxgi,d3d12,d3d10=b",
         "wined3d": "d3d11,dxgi,d3d12,d3d9=b",
     }
     parts = [table[graphics]] if graphics in table else []
@@ -356,7 +783,10 @@ def prepare_and_launch(argv: list[str], applied: dict[str, str]) -> int:
     extra_dll = conf_get(applied, "KEEL_DLL", "dll", "")
     extra_args = conf_get(applied, "KEEL_ARGS", "args", "")
 
-    wine = find_runner(runner_name)
+    variant, variant_key = graphics_runner(graphics)
+    wine = variant if variant is not None else find_runner(runner_name)
+    dxmt_runner = graphics == "dxmt" and variant is not None and runner_has_dxmt(variant)
+    dry_run = os.environ.get("KEEL_DRY_RUN", "") == "1"
     prefix = prefix_path()
     if steamworks == "prefix" and steam_exe_path().is_file():
         prefix = steam_client_prefix()
@@ -371,18 +801,68 @@ def prepare_and_launch(argv: list[str], applied: dict[str, str]) -> int:
         for candidate in family_candidates(runner_name):
             log(f"  missing {candidate}")
         return 1
-    log(f"wine: {wine}")
+    log(f"wine: {wine} ({'from ' + variant_key if variant_key else 'KEEL_WINE/runner'})")
     log(f"prefix: {prefix}")
 
+    bridge = steamworks == "bridge"
+    if bridge:
+        problems = bridge_problems(wine)
+        if problems:
+            log("steamworks=bridge is not ready:")
+            for problem in problems:
+                log(f"  {problem}")
+            return 1
+        extra = dyld_paths()
+        current = [p for p in os.environ.get("DYLD_FALLBACK_LIBRARY_PATH", "").split(":") if p]
+        fallback = extra + [p for p in current if p not in extra]
+        for default in ("/usr/local/lib", "/usr/lib"):
+            if default not in fallback:
+                fallback.append(default)
+        os.environ["DYLD_FALLBACK_LIBRARY_PATH"] = ":".join(fallback)
+        aid_env = appid()
+        if aid_env:
+            os.environ.setdefault("SteamAppId", aid_env)
+            os.environ.setdefault("SteamGameId", aid_env)
+
+    if dry_run:
+        if graphics == "dxmt" and dxmt_runner:
+            backend = "runner builtins (d3d11,dxgi,d3d10core=b) + system32/winemetal.dll"
+        elif graphics == "dxmt":
+            backend = f"native staging from {dxmt_dll_dir()}"
+        else:
+            backend = dll_overrides(graphics, "")
+        overrides = dll_overrides("dxmt-runner" if dxmt_runner else graphics, extra_dll)
+        if bridge:
+            overrides = ";".join(part for part in (overrides, "steamclient64=n,b") if part)
+        launch = list(command) + (extra_args.split() if extra_args else [])
+        if bridge:
+            launch = [BRIDGE_STEAM_DIR + r"\keel_steam.exe", *launch]
+        log(f"dry run: graphics={graphics} via {backend}")
+        log(f"dry run: WINEDLLOVERRIDES={overrides}")
+        log("dry run: command: " + " ".join([str(wine), *launch]))
+        log("dry run: no prefix changes, Wine not started")
+        return 0
+
     ensure_prefix(wine, prefix, winver)
+    retina = conf_get(applied, "KEEL_RETINA", "retina", "1")
+    if retina in ("0", "1"):
+        apply_retina(wine, prefix, retina == "1")
+    apply_dpi(wine, prefix, conf_get(applied, "KEEL_DPI", "dpi", ""))
     env = wine_env(wine, prefix)
     if esync == "1":
         env["WINEESYNC"] = "1"
+        # CrossOver-derived runners (incl. Keel's Wine 11 build) implement fast sync as
+        # mach-port "msync"; without it every wait/event is a wineserver round trip
+        # (~8 us vs ~0.1 us), which starves multithreaded video decoders (P5R's CRI Mana).
+        env.setdefault("WINEMSYNC", "1")
     env["ROSETTA_ADVERTISE_AVX"] = "1"
     env["MTL_HUD_ENABLED"] = "1" if hud == "1" else "0"
     env["DXMT_LOG_LEVEL"] = "info" if hud == "1" else "none"
 
-    if graphics == "dxmt":
+    if graphics == "dxmt" and dxmt_runner:
+        ensure_winemetal(prefix, wine)
+        log(f"dxmt: runner builtins ({runner_root(wine)})")
+    elif graphics == "dxmt":
         dlls = dxmt_dll_dir()
         if dlls is None:
             log("DXMT not installed; falling back to WineD3D. Run: keel fetch-dxmt")
@@ -400,7 +880,13 @@ def prepare_and_launch(argv: list[str], applied: dict[str, str]) -> int:
     elif graphics == "d3dmetal":
         log("D3DMetal uses the runner's builtin. CrossOver or Game Porting Toolkit is required.")
 
-    env["WINEDLLOVERRIDES"] = dll_overrides(graphics, extra_dll)
+    overrides = dll_overrides("dxmt-runner" if dxmt_runner else graphics, extra_dll)
+    if bridge:
+        stage_bridge(prefix, wine)
+        overrides = ";".join(part for part in (overrides, "steamclient64=n,b") if part)
+        log(f"steamworks: bridge (lsteamclient -> {mac_steamclient()})")
+        log(f"DYLD_FALLBACK_LIBRARY_PATH={env.get('DYLD_FALLBACK_LIBRARY_PATH', '')}")
+    env["WINEDLLOVERRIDES"] = overrides
 
     launch = list(command)
     aid = appid()
@@ -414,10 +900,25 @@ def prepare_and_launch(argv: list[str], applied: dict[str, str]) -> int:
             log("steamworks=prefix but Windows Steam is not installed. Run: keel setup-steam")
     if extra_args:
         launch.extend(extra_args.split())
+    if bridge:
+        launch = [BRIDGE_STEAM_DIR + r"\keel_steam.exe", *launch]
 
     log("command: " + " ".join(launch))
-    proc = subprocess.Popen([str(wine), *launch], env=env)
-    code = proc.wait()
+    wine_log_setting = conf_get(applied, "KEEL_WINE_LOG", "wine_log", "1")
+    wine_log = None
+    if wine_log_setting == "1" and os.environ.get("STEAM_COMPAT_DATA_PATH"):
+        log_path = Path(os.environ["STEAM_COMPAT_DATA_PATH"]) / "wine.log"
+        try:
+            wine_log = open(log_path, "w", encoding="utf-8")
+            log(f"wine output: {log_path} (WINEDEBUG={env.get('WINEDEBUG', '')})")
+        except OSError:
+            wine_log = None
+    try:
+        proc = subprocess.Popen([str(wine), *launch], env=env, stdout=wine_log, stderr=wine_log)
+        code = proc.wait()
+    finally:
+        if wine_log is not None:
+            wine_log.close()
     wineserver = wine.parent / "wineserver"
     if executable(wineserver):
         subprocess.run([str(wineserver), "-w"], env=env, check=False)
@@ -502,7 +1003,10 @@ def fetch_dxmt() -> int:
     else:
         with tarfile.open(archive_path, "r:*") as archive:
             safe_extract(archive, extract_root)
-    dll = next(extract_root.rglob("d3d11.dll"), None)
+    found = sorted(extract_root.rglob("d3d11.dll"))
+    dll = next((d for d in found if d.parent.name in ("x86_64-windows", "x64")), None)
+    if dll is None:
+        dll = next((d for d in found if "i386" not in str(d) and "x32" not in str(d)), found[0] if found else None)
     if dll is None:
         log("archive did not contain d3d11.dll")
         return 1
@@ -545,13 +1049,617 @@ def doctor() -> int:
         f"Windows depot switch: {'on' if switch else 'off'}",
         f"Python: {sys.version.split()[0]}",
     ]
-    for name in ("crossover", "gptk", "whisky", "wine"):
-        found = find_runner(name)
-        lines.append(f"{name}: {found if found else 'not found'}")
+    forced = os.environ.get("KEEL_WINE", "")
+    if forced:
+        ok = forced_runner() is not None
+        lines.append(f"KEEL_WINE (forces every launch): {forced}{'' if ok else '  [NOT EXECUTABLE]'}")
+    saved = os.environ.pop("KEEL_WINE", None)
+    try:
+        for name in ("crossover", "gptk", "whisky", "wine"):
+            found = find_runner(name)
+            lines.append(f"{name}: {found if found else 'not found'}")
+    finally:
+        if saved is not None:
+            os.environ["KEEL_WINE"] = saved
+    problems = bridge_problems(find_runner("auto"))
+    lines.append("Steamworks bridge: " + ("ready" if not problems else "not ready"))
+    for problem in problems:
+        lines.append(f"  {problem}")
+    lines.extend(checklist_lines(bridge_checklist()))
+    present, applied, missing = cx_src_status()
+    if not present:
+        lines.append(f"CrossOver sources: not found at {cx_src_dir()} (keel fetch-crossover-src)")
+    else:
+        state = "patched" if not missing else "missing " + ", ".join(m[:4] for m in missing)
+        lines.append(f"CrossOver sources: {cx_src_dir()} ({state}; {len(applied)}/{len(applied) + len(missing)})")
     dlls = dxmt_dll_dir()
     lines.append(f"DXMT: {dlls if dlls else 'not installed (keel fetch-dxmt)'}")
+    apps = sorted((support_dir() / "apps").glob("*.conf"))
+    if apps:
+        lines.append("Per-app graphics:")
+    for conf in apps:
+        values = load_conf(conf)
+        graphics = values.get("KEEL_GRAPHICS", values.get("graphics", "auto (default)"))
+        line = f"  {conf.stem}: {graphics}"
+        variant = values.get({"dxmt": "KEEL_WINE_DXMT", "d3dmetal": "KEEL_WINE_D3DMETAL"}.get(graphics, ""), "")
+        if variant:
+            line += f"  runner {variant}"
+        lines.append(line)
     text = "\n".join(lines)
     print(text)
+    return 0
+
+
+GRAPHICS_CHOICES = ("d3dmetal", "dxmt", "dxvk", "wined3d", "auto")
+
+
+def graphics_command(argv: list[str]) -> int:
+    if len(argv) < 3 or not argv[2].isdigit():
+        sys.stderr.write("usage: keel graphics <appid> [" + "|".join(GRAPHICS_CHOICES) + "]\n")
+        return 1
+    conf = support_dir() / "apps" / f"{argv[2]}.conf"
+    values = load_conf(conf)
+    if len(argv) < 4:
+        print(values.get("KEEL_GRAPHICS", values.get("graphics", "auto")))
+        return 0
+    choice = argv[3].lower()
+    if choice not in GRAPHICS_CHOICES:
+        sys.stderr.write(f"unknown backend {choice}; choose one of {', '.join(GRAPHICS_CHOICES)}\n")
+        return 1
+    lines = conf.read_text(encoding="utf-8").splitlines() if conf.is_file() else []
+    backup = conf.with_name(conf.name + ".bak")
+    if conf.is_file() and not backup.exists():
+        shutil.copy2(conf, backup)
+    out, done = [], False
+    for line in lines:
+        key = line.split("=", 1)[0].strip() if "=" in line and not line.lstrip().startswith("#") else ""
+        if key in ("KEEL_GRAPHICS", "graphics"):
+            if not done:
+                out.append(f"KEEL_GRAPHICS={choice}")
+                done = True
+            continue
+        out.append(line)
+    if not done:
+        out.append(f"KEEL_GRAPHICS={choice}")
+    conf.parent.mkdir(parents=True, exist_ok=True)
+    conf.write_text("\n".join(out) + "\n", encoding="utf-8")
+    print(f"{argv[2]}: KEEL_GRAPHICS={choice}  ({conf})")
+    return 0
+
+
+# ---- Steam library helpers: list / collection / platform / attach ----------
+
+def steam_root() -> Path:
+    return Path.home() / "Library" / "Application Support" / "Steam"
+
+
+def steam_dev_cfg() -> Path:
+    return steam_root() / "Steam.AppBundle" / "Steam" / "Contents" / "MacOS" / "steam_dev.cfg"
+
+
+def steam_running() -> bool:
+    for name in ("steam_osx", "Steam"):
+        if subprocess.run(["pgrep", "-x", name], capture_output=True).returncode == 0:
+            return True
+    return False
+
+
+def steam_user_dirs() -> list[Path]:
+    base = steam_root() / "userdata"
+    if not base.is_dir():
+        return []
+    return sorted(p for p in base.iterdir() if p.name.isdigit() and (p / "config").is_dir())
+
+
+def vdf_tokens(text: str):
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c.isspace():
+            i += 1
+        elif c == "/" and text.startswith("//", i):
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+        elif c in "{}":
+            yield c
+            i += 1
+        elif c == '"':
+            j, out = i + 1, []
+            while j < n and text[j] != '"':
+                if text[j] == "\\" and j + 1 < n:
+                    out.append({"n": "\n", "t": "\t"}.get(text[j + 1], text[j + 1]))
+                    j += 2
+                    continue
+                out.append(text[j])
+                j += 1
+            yield "".join(out)
+            i = j + 1
+        else:
+            j = i
+            while j < n and not text[j].isspace() and text[j] not in '{}"':
+                j += 1
+            yield text[i:j]
+            i = j
+
+
+def vdf_load(text: str) -> dict:
+    root: dict = {}
+    stack, key = [root], None
+    for tok in vdf_tokens(text):
+        if tok == "{":
+            child: dict = {}
+            stack[-1][key] = child
+            stack.append(child)
+            key = None
+        elif tok == "}":
+            stack.pop()
+        elif key is None:
+            key = tok
+        else:
+            stack[-1][key] = tok
+            key = None
+    return root
+
+
+def vdf_get(node: dict, *path: str):
+    for part in path:
+        if not isinstance(node, dict):
+            return None
+        match = next((k for k in node if k.lower() == part.lower()), None)
+        if match is None:
+            return None
+        node = node[match]
+    return node
+
+
+def localconfig_path(user: Path) -> Path:
+    return user / "config" / "localconfig.vdf"
+
+
+def launch_options(user: Path) -> dict[str, str]:
+    path = localconfig_path(user)
+    if not path.is_file():
+        return {}
+    data = vdf_load(path.read_text(encoding="utf-8", errors="replace"))
+    apps = vdf_get(data, "UserLocalConfigStore", "Software", "Valve", "Steam", "apps") or {}
+    return {k: v.get("LaunchOptions", "") for k, v in apps.items() if isinstance(v, dict)}
+
+
+def keel_attached(options: str) -> bool:
+    return "keel-launch" in options or "keel-proton/keel" in options
+
+
+def library_folders() -> list[Path]:
+    roots = [steam_root()]
+    lf = steam_root() / "steamapps" / "libraryfolders.vdf"
+    if lf.is_file():
+        data = vdf_get(vdf_load(lf.read_text(encoding="utf-8", errors="replace")), "libraryfolders") or {}
+        for entry in data.values():
+            if isinstance(entry, dict) and entry.get("path"):
+                roots.append(Path(entry["path"]))
+    seen, out = set(), []
+    for r in roots:
+        s = r / "steamapps"
+        if s.is_dir() and s.resolve() not in seen:
+            seen.add(s.resolve())
+            out.append(s)
+    return out
+
+
+IGNORED_APPS = {"228980"}
+
+
+def installed_games() -> list[dict[str, str]]:
+    games = []
+    for steamapps in library_folders():
+        for manifest in sorted(steamapps.glob("appmanifest_*.acf")):
+            state = vdf_get(vdf_load(manifest.read_text(encoding="utf-8", errors="replace")), "AppState") or {}
+            app = state.get("appid", "")
+            if not app or app in IGNORED_APPS:
+                continue
+            games.append({"appid": app, "name": state.get("name", app),
+                          "dir": str(steamapps / "common" / state.get("installdir", ""))})
+    return games
+
+
+def is_macho(path: Path) -> bool:
+    try:
+        with open(path, "rb") as f:
+            magic = f.read(4)
+    except OSError:
+        return False
+    return magic in (b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe", b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca")
+
+
+def installed_build(directory: Path) -> str:
+    if not directory.is_dir():
+        return "missing"
+    mac = win = False
+    for root, dirs, files in os.walk(directory):
+        depth = Path(root).relative_to(directory).parts
+        if any(d.endswith(".app") for d in dirs):
+            mac = True
+        dirs[:] = [d for d in dirs if not d.endswith(".app")] if len(depth) < 3 else []
+        for f in files:
+            if f.lower().endswith(".exe"):
+                win = True
+            elif not mac and "." not in f and is_macho(Path(root) / f):
+                mac = True
+        if mac and win:
+            break
+    return "both" if mac and win else "mac" if mac else "windows" if win else "unknown"
+
+
+def store_platforms(app: str, offline: bool = False) -> dict | None:
+    """Platforms from the public Steam store API, cached for a week."""
+    cache = Path.home() / "Library" / "Caches" / "Keel" / "appdetails"
+    path = cache / f"{app}.json"
+    try:
+        cached = json.loads(path.read_text())
+        if offline or datetime.now(timezone.utc).timestamp() - path.stat().st_mtime < 7 * 86400:
+            return cached
+    except (OSError, ValueError):
+        cached = None
+    if offline:
+        return None
+    url = f"https://store.steampowered.com/api/appdetails?appids={app}&filters=platforms"
+    try:
+        with urllib.request.urlopen(url, timeout=6) as response:
+            data = json.load(response).get(app, {})
+    except Exception:
+        return cached
+    platforms = data.get("data", {}).get("platforms") if data.get("success") else None
+    if platforms is None:
+        platforms = {}
+    cache.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(platforms))
+    return platforms
+
+
+def game_status(build: str, attached: bool, platforms: dict | None) -> str:
+    has_mac = None if not platforms else bool(platforms.get("mac"))
+    if build in ("mac", "both"):
+        return "Mac native"
+    if build == "windows":
+        if has_mac:
+            return "Mac build available but Windows installed" + (" (Keel attached)" if attached else "")
+        return "Windows via Keel" if attached else "Windows, no Keel launch option (won't run)"
+    return build
+
+
+def platform_switch_on() -> bool:
+    cfg = steam_dev_cfg()
+    if not cfg.is_file():
+        return False
+    return any(line.strip().startswith("@sSteamCmdForcePlatformType") and line.split()[-1:] == ["windows"]
+               for line in cfg.read_text(encoding="utf-8", errors="replace").splitlines())
+
+
+def list_command(argv: list[str]) -> int:
+    offline = "--offline" in argv
+    users = steam_user_dirs()
+    options: dict[str, str] = {}
+    for user in users:
+        for k, v in launch_options(user).items():
+            options[k] = options.get(k) or v
+    rows = []
+    for game in installed_games():
+        build = installed_build(Path(game["dir"]))
+        attached = keel_attached(options.get(game["appid"], ""))
+        platforms = store_platforms(game["appid"], offline)
+        store = "?" if platforms is None else ("mac+win" if platforms.get("mac") and platforms.get("windows")
+                                              else "mac" if platforms.get("mac") else "win" if platforms.get("windows") else "?")
+        rows.append((game["name"], game["appid"], build, store, "yes" if attached else "no",
+                     game_status(build, attached, platforms)))
+    header = ("NAME", "APPID", "INSTALLED", "STORE", "KEEL", "STATUS")
+    widths = [max(len(str(r[i])) for r in rows + [header]) for i in range(5)]
+    for r in [header] + rows:
+        print("  ".join(str(r[i]).ljust(widths[i]) for i in range(5)) + "  " + r[5])
+    print(f"\nWindows depot switch (steam_dev.cfg): {'ON' if platform_switch_on() else 'off'}")
+    if any(r[3] == "?" for r in rows):
+        print("STORE '?' = store lookup unavailable (offline or delisted); run again online.")
+    return 0
+
+
+def keel_appids() -> list[int]:
+    ids: set[int] = set()
+    for user in steam_user_dirs():
+        ids.update(int(k) for k, v in launch_options(user).items() if k.isdigit() and keel_attached(v))
+    return sorted(ids)
+
+
+def timestamp_suffix() -> str:
+    return datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+# ---- Steam CEF DevTools (needs Steam started with -cef-enable-debugging) ----
+
+CEF_PORT = int(os.environ.get("KEEL_CEF_PORT", "8080"))
+
+
+def cef_shared_context_ws() -> str | None:
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{CEF_PORT}/json", timeout=3) as response:
+            targets = json.load(response)
+    except Exception:
+        return None
+    for target in targets:
+        if target.get("title") == "SharedJSContext" and target.get("webSocketDebuggerUrl"):
+            return target["webSocketDebuggerUrl"]
+    return None
+
+
+def cef_eval(ws_url: str, expression: str, timeout: float = 15.0):
+    """Evaluate JS in a CEF target over a minimal stdlib WebSocket client."""
+    import base64
+    import socket
+    import struct
+    from urllib.parse import urlparse
+
+    url = urlparse(ws_url)
+    sock = socket.create_connection((url.hostname, url.port or 80), timeout=timeout)
+    try:
+        key = base64.b64encode(os.urandom(16)).decode()
+        sock.sendall((f"GET {url.path} HTTP/1.1\r\nHost: {url.hostname}:{url.port}\r\nUpgrade: websocket\r\n"
+                      f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
+        head = b""
+        while b"\r\n\r\n" not in head:
+            chunk = sock.recv(4096)
+            if not chunk:
+                raise OSError("websocket handshake failed")
+            head += chunk
+        if b" 101 " not in head.split(b"\r\n", 1)[0]:
+            raise OSError("websocket handshake refused")
+        buffer = head.split(b"\r\n\r\n", 1)[1]
+
+        def recv_exact(count: int) -> bytes:
+            nonlocal buffer
+            while len(buffer) < count:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    raise OSError("websocket closed")
+                buffer += chunk
+            data, buffer = buffer[:count], buffer[count:]
+            return data
+
+        payload = json.dumps({"id": 1, "method": "Runtime.evaluate", "params": {
+            "expression": expression, "awaitPromise": True, "returnByValue": True}}).encode()
+        mask = os.urandom(4)
+        length = len(payload)
+        header = bytes([0x81]) + (bytes([0x80 | length]) if length < 126 else
+                                  bytes([0x80 | 126]) + struct.pack(">H", length) if length < 65536 else
+                                  bytes([0x80 | 127]) + struct.pack(">Q", length))
+        sock.sendall(header + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+        message = b""
+        while True:
+            b0, b1 = recv_exact(2)
+            size = b1 & 0x7F
+            if size == 126:
+                size = struct.unpack(">H", recv_exact(2))[0]
+            elif size == 127:
+                size = struct.unpack(">Q", recv_exact(8))[0]
+            data = recv_exact(size)
+            opcode = b0 & 0x0F
+            if opcode == 8:
+                raise OSError("websocket closed")
+            if opcode in (0, 1, 2):
+                message += data
+                if b0 & 0x80:
+                    reply = json.loads(message)
+                    message = b""
+                    if reply.get("id") == 1:
+                        result = reply.get("result", {})
+                        if "exceptionDetails" in result:
+                            raise RuntimeError(json.dumps(result["exceptionDetails"])[:500])
+                        return result.get("result", {}).get("value")
+    finally:
+        sock.close()
+
+
+KEEL_COLLECTION_JS = r"""
+(async () => {
+  const want = %s, preferred = %s;
+  const all = collectionStore.userCollections.filter(c => c.displayName === 'Keel');
+  let keep = all.find(c => c.id === preferred) || all[0];
+  let removed = 0;
+  for (const c of all) if (c !== keep) { await c.Delete(); removed++; }
+  if (!keep) keep = collectionStore.NewUnsavedCollection('Keel', undefined, []);
+  const ov = ids => ids.map(id => appStore.GetAppOverviewByAppID(id)).filter(Boolean);
+  const have = keep.allApps.map(a => a.appid);
+  const add = want.filter(id => !have.includes(id)), drop = have.filter(id => !want.includes(id));
+  if (add.length) keep.AddApps(ov(add));
+  if (drop.length) keep.RemoveApps(ov(drop));
+  await keep.Save();
+  const c = collectionStore.GetCollection(keep.id);
+  return {id: keep.id, apps: c ? c.allApps.map(a => a.appid).sort((x, y) => x - y) : null,
+          added: add, dropped: drop, removedDuplicates: removed};
+})()
+"""
+
+
+def collection_via_cef(apps: list[int], preferred_id: str = "") -> dict | None:
+    ws = cef_shared_context_ws()
+    if not ws:
+        return None
+    js = KEEL_COLLECTION_JS % (json.dumps(apps), json.dumps(preferred_id))
+    return cef_eval(ws, js)
+
+
+def existing_keel_id(users: list[Path]) -> str:
+    for user in users:
+        ns = user / "config" / "cloudstorage" / "cloud-storage-namespace-1.json"
+        try:
+            for key, entry in json.loads(ns.read_text(encoding="utf-8")):
+                if key.startswith("user-collections.") and not entry.get("is_deleted") and \
+                        json.loads(entry.get("value", "{}")).get("name") == "Keel":
+                    return key.split(".", 1)[1]
+        except (OSError, ValueError):
+            pass
+    return ""
+
+
+def collection_command(argv: list[str]) -> int:
+    dry = "--dry-run" in argv or "-n" in argv
+    apps = keel_appids()
+    users = steam_user_dirs()
+    if not users:
+        sys.stderr.write("no Steam userdata found\n")
+        return 1
+    if not dry and "--json" not in argv and cef_shared_context_ws():
+        # Primary path: ask Steam's own library code to save the collection. It updates the
+        # in-memory store, the CEF localStorage cache and the cloud, so it shows up immediately.
+        try:
+            result = collection_via_cef(apps, existing_keel_id(users))
+        except Exception as error:
+            result = None
+            sys.stderr.write(f"Steam DevTools path failed ({error}); falling back\n")
+        if result:
+            print(f"Steam: collection Keel ({result['id']}) = {result['apps']}"
+                  f"  added {result['added']} removed {result['dropped']} duplicates deleted {result['removedDuplicates']}")
+            return 0 if result["apps"] == apps else 1
+    if steam_running() and not dry:
+        sys.stderr.write("Steam is running without -cef-enable-debugging, so Keel cannot talk to it and a file edit "
+                         "would be overwritten. Either quit Steam and run `keel collection sync`, or restart it with\n"
+                         "  open -a Steam --args -cef-enable-debugging\nand run `keel collection sync` again "
+                         "(recommended: Steam then saves the collection itself).\n")
+        return 2
+    status = 0
+    for user in users:
+        cs = user / "config" / "cloudstorage"
+        ns = cs / "cloud-storage-namespace-1.json"
+        if not ns.is_file():
+            continue
+        entries = json.loads(ns.read_text(encoding="utf-8"))
+        existing = None
+        for key, entry in entries:
+            if key.startswith("user-collections.") and not entry.get("is_deleted"):
+                try:
+                    value = json.loads(entry.get("value", "{}"))
+                except ValueError:
+                    continue
+                if value.get("name") == "Keel":
+                    existing = (key, entry, value)
+                    break
+        if existing and sorted(existing[2].get("added", [])) == apps and not existing[2].get("removed"):
+            print(f"{user.name}: collection Keel already up to date ({len(apps)} games)")
+            continue
+        cid = existing[2]["id"] if existing else "uc-" + "".join(
+            __import__("secrets").choice("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789") for _ in range(12))
+        key = f"user-collections.{cid}"
+        value = json.dumps({"id": cid, "name": "Keel", "added": apps, "removed": []}, separators=(",", ":"))
+        print(f"{user.name}: {'update' if existing else 'create'} collection Keel ({cid}) = {apps}")
+        if dry:
+            continue
+        stamp = timestamp_suffix()
+        backups = cs.parent / f"cloudstorage.keel-backup-{stamp}"
+        shutil.copytree(cs, backups)
+        try:
+            version = str(json.loads((cs / "cloud-storage-namespaces.json").read_text())[0][1])
+        except Exception:
+            version = existing[1].get("version", "0") if existing else "0"
+        new = {"key": key, "timestamp": int(datetime.now(timezone.utc).timestamp()), "value": value,
+               "version": version}
+        now = new["timestamp"]
+        for k, e in entries:
+            if k != key and k.startswith("user-collections.") and not e.get("is_deleted"):
+                try:
+                    dup = json.loads(e.get("value", "{}")).get("name") == "Keel"
+                except ValueError:
+                    dup = False
+                if dup:
+                    e.pop("value", None)
+                    e.update(is_deleted=True, timestamp=now)
+                    print(f"  deleting duplicate {k}")
+        entries = [e for e in entries if e[0] != key] + [[key, new]]
+        tmp = ns.with_suffix(".json.keel-tmp")
+        tmp.write_text(json.dumps(entries, separators=(",", ":")), encoding="utf-8")
+        json.loads(tmp.read_text(encoding="utf-8"))
+        tmp.replace(ns)
+        mod = cs / "cloud-storage-namespace-1.modified.json"
+        try:
+            modified = json.loads(mod.read_text(encoding="utf-8")) if mod.is_file() else []
+        except ValueError:
+            modified = []
+        if key not in modified:
+            modified.append(key)
+        mod.write_text(json.dumps(modified), encoding="utf-8")
+        print(f"  wrote {ns}\n  backup {backups}")
+    return status
+
+
+def platform_command(argv: list[str]) -> int:
+    choice = argv[2].lower() if len(argv) > 2 else "status"
+    cfg = steam_dev_cfg()
+    on = platform_switch_on()
+    if choice == "status":
+        print(f"Windows depot switch: {'ON (new downloads/updates fetch Windows builds)' if on else 'off (Steam picks Mac builds when available)'}")
+        print(f"  {cfg}")
+        return 0
+    if choice not in ("windows", "mac"):
+        sys.stderr.write("usage: keel platform windows|mac|status\n")
+        return 1
+    want = choice == "windows"
+    if want == on:
+        print(f"already {'ON' if on else 'off'}")
+        return 0
+    lines = cfg.read_text(encoding="utf-8").splitlines() if cfg.is_file() else []
+    if cfg.is_file():
+        shutil.copy2(cfg, cfg.with_name(cfg.name + ".keel-backup-" + timestamp_suffix()))
+    lines = [l for l in lines if "sSteamCmdForcePlatformType" not in l]
+    if want:
+        lines.append("@sSteamCmdForcePlatformType windows")
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    print(f"Windows depot switch now {'ON' if want else 'off'}.")
+    print("Restart Steam for it to take effect." if steam_running() else "Takes effect next time Steam starts.")
+    if want:
+        print("Turn it off again (keel platform mac) once the Windows-only game finishes installing.")
+    return 0
+
+
+def attach_command(argv: list[str]) -> int:
+    if len(argv) < 3 or not argv[2].isdigit():
+        sys.stderr.write(f"usage: keel {argv[1]} <appid>\n")
+        return 1
+    if steam_running():
+        sys.stderr.write("Quit Steam first; it rewrites localconfig.vdf on exit.\n")
+        return 2
+    app, attach = argv[2], argv[1] == "attach"
+    launcher = tool_dir() / "keel-launch"
+    wanted = f'"{launcher}" waitforexitandrun %command%'
+    escaped = wanted.replace("\\", "\\\\").replace('"', '\\"')
+    for user in steam_user_dirs():
+        path = localconfig_path(user)
+        if not path.is_file():
+            continue
+        lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+        depth, in_apps, app_depth, start, end = 0, False, -1, -1, -1
+        path_stack: list[str] = []
+        last = None
+        for i, line in enumerate(lines):
+            s = line.strip()
+            if s == "{":
+                path_stack.append(last or "")
+                if [p.lower() for p in path_stack[-6:]] == ["userlocalconfigstore", "software", "valve", "steam", "apps", app]:
+                    start = i
+            elif s == "}":
+                if start >= 0 and end < 0 and len(path_stack) and path_stack[-1] == app and \
+                        [p.lower() for p in path_stack[-6:-1]] == ["userlocalconfigstore", "software", "valve", "steam", "apps"]:
+                    end = i
+                path_stack.pop()
+            elif s.startswith('"'):
+                last = s.split('"')[1]
+        if start < 0:
+            print(f"{user.name}: app {app} not in localconfig.vdf (launch it once or open its Properties)")
+            continue
+        indent = lines[start][: len(lines[start]) - len(lines[start].lstrip())] + "\t"
+        body = [l for l in lines[start + 1:end] if not (l.strip().startswith('"LaunchOptions"') and l.count('"') >= 4
+                                                    and lines.index(l, start) and l.startswith(indent + '"'))]
+        if attach:
+            body.insert(0, f'{indent}"LaunchOptions"\t\t"{escaped}"\n')
+        shutil.copy2(path, path.with_name(path.name + ".keel-backup-" + timestamp_suffix()))
+        path.write_text("".join(lines[: start + 1] + body + lines[end:]), encoding="utf-8")
+        print(f"{user.name}: {'attached' if attach else 'detached'} {app}")
     return 0
 
 
@@ -576,6 +1684,21 @@ def main(argv: list[str]) -> int:
     if verb == "doctor":
         apply_config()
         return doctor()
+    if verb == "setup-bridge":
+        apply_config()
+        return setup_bridge(argv)
+    if verb == "graphics":
+        return graphics_command(argv)
+    if verb == "list":
+        return list_command(argv)
+    if verb == "collection":
+        return collection_command(argv)
+    if verb == "platform":
+        return platform_command(argv)
+    if verb in ("attach", "detach"):
+        return attach_command(argv)
+    if verb == "fetch-crossover-src":
+        return fetch_crossover_src(argv)
     if verb == "fetch-dxmt":
         return fetch_dxmt()
     if verb == "setup-steam":

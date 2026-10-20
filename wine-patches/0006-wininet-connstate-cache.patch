@@ -1,0 +1,35 @@
+--- a/dlls/wininet/internet.c
++++ b/dlls/wininet/internet.c
+@@ -1532,6 +1532,11 @@
+ }
+ 
+ 
++/* Keel: games (P5R) poll InternetGetConnectedState every frame; a full GetAdaptersAddresses
++ * with gateways costs ~6 ms through nsiproxy on macOS. Cache the status for 2 seconds. */
++static volatile LONG keel_conn_status = -1;
++static volatile DWORD keel_conn_tick;
++
+ /***********************************************************************
+  *           InternetGetConnectedStateExW (WININET.@)
+  *
+@@ -1575,6 +1580,9 @@
+         return FALSE;
+     }
+ 
++    status = keel_conn_status;
++    if (status != (DWORD)-1 && GetTickCount() - keel_conn_tick < 2000) goto have_status;
++
+     for (;;)
+     {
+         ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER |
+@@ -1615,7 +1623,10 @@
+         }
+     }
+     free(buf);
++    keel_conn_tick = GetTickCount();
++    keel_conn_status = status;
+ 
++have_status:
+     if (lpdwStatus) *lpdwStatus = status;
+ 
+     /* When the buffer size is zero LoadStringW fills the buffer with a pointer to
